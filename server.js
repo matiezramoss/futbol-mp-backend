@@ -1,186 +1,124 @@
 // server.js
-const express = require('express');
-const cors = require('cors');
-const mercadopago = require('mercadopago');
-const admin = require('firebase-admin');
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+
+// SDK v2
+import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 
 const app = express();
-
-// Middlewares (MP a veces manda urlencoded)
+app.use(cors());
 app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-// CORS: RN no necesita CORS, pero si querés testear desde web, dejalo abierto
-app.use(cors({ origin: true }));
-
-/**
- * ====== Config Mercado Pago ======
- * Usá tu ACCESS_TOKEN de TEST en Render (variable MP_ACCESS_TOKEN)
- */
-const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
-if (!MP_ACCESS_TOKEN) {
-  console.warn('[WARN] MP_ACCESS_TOKEN no seteado');
-}
-mercadopago.configurations.setAccessToken(MP_ACCESS_TOKEN);
-
-/**
- * ====== Config Firebase Admin ======
- * En Render setearás FIREBASE_SERVICE_ACCOUNT con el JSON completo
- * del service account (pegado tal cual).
- */
-const svcJson = process.env.FIREBASE_SERVICE_ACCOUNT
-  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-  : null;
-
-if (!admin.apps.length) {
-  if (svcJson) {
-    admin.initializeApp({
-      credential: admin.credential.cert(svcJson),
-    });
-  } else {
-    console.warn('[WARN] FIREBASE_SERVICE_ACCOUNT no seteado — No se podrá escribir en Firestore');
-    admin.initializeApp();
-  }
-}
-
-const db = admin.firestore();
-
-/** Salud */
-app.get('/health', (_req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
-
-/**
- * Crea una preferencia de pago.
- * body esperado:
- * {
- *   reservaId, complejoId, title, price,
- *   quantity?, payer?: { email, name },
- *   backUrls?: { success, failure, pending }
- * }
- */
-app.post('/create-preference', async (req, res) => {
-  try {
-    const {
-      reservaId,
-      complejoId,
-      title,
-      price,
-      quantity = 1,
-      payer = {},
-      backUrls = {},
-      metadata = {}
-    } = req.body || {};
-
-    if (!reservaId || !complejoId || !price) {
-      return res.status(400).json({ error: 'Falta reservaId/complejoId/price' });
-    }
-
-    const external_reference = `${complejoId}|${reservaId}`;
-
-    // Construyo la notification_url con el host público del propio server
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
-    const notification_url = `${baseUrl}/webhook`;
-
-    const preference = {
-      items: [
-        {
-          title: title || `Reserva ${reservaId}`,
-          quantity: Number(quantity) || 1,
-          unit_price: Number(price),
-        },
-      ],
-      payer: {
-        email: payer.email || undefined,
-        name: payer.name || undefined,
-      },
-      external_reference,
-      metadata,
-      back_urls: {
-        success: backUrls.success || `${baseUrl}/ok`,
-        failure: backUrls.failure || `${baseUrl}/fail`,
-        pending: backUrls.pending || `${baseUrl}/pending`,
-      },
-      auto_return: 'approved',
-      notification_url, // 👈 Render es público: MP puede pegar acá
-    };
-
-    const mpRes = await mercadopago.preferences.create(preference);
-    const { id, init_point, sandbox_init_point } = mpRes.body || {};
-
-    return res.json({
-      preference_id: id,
-      init_point,
-      sandbox_init_point,
-    });
-  } catch (e) {
-    console.error('create-preference error', e);
-    return res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-/**
- * Webhook de MP:
- * - MP envía { data: { id }, action, type } (varía)
- * - Consultamos el pago por ID y actualizamos la reserva en Firestore:
- *   /complejos/{complejoId}/reservas/{reservaId}
- */
-app.post('/webhook', async (req, res) => {
-  try {
-    const body = req.body || {};
-    console.log('[webhook] raw body:', JSON.stringify(body).slice(0, 1000));
-
-    // MP suele mandar { data: { id }, type: 'payment', action: 'payment.updated' }
-    const paymentId = body?.data?.id || body?.id || body?.resource?.split('/').pop();
-    if (!paymentId) {
-      // Aceptamos igual para que MP no reintente eternamente
-      return res.status(200).send('ok - no payment id');
-    }
-
-    // Busco el pago en MP
-    const r = await mercadopago.payment.findById(paymentId);
-    const payment = r?.response || {};
-    const status = payment?.status; // approved | rejected | pending | in_process
-    const external_reference = payment?.external_reference || '';
-    const orderId = payment?.order?.id;
-
-    console.log('[webhook] payment:', { paymentId, status, external_reference, orderId });
-
-    // Parseo referencia "complejoId|reservaId"
-    if (external_reference && external_reference.includes('|') && svcJson) {
-      const [complejoId, reservaId] = external_reference.split('|');
-
-      const ref = db.doc(`complejos/${complejoId}/reservas/${reservaId}`);
-      const update = {
-        mpPaymentId: String(paymentId),
-        mpStatus: String(status || ''),
-        mpRaw: payment,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      };
-
-      if (status === 'approved') {
-        update.estado = 'confirmada';
-        update.paidAt = admin.firestore.FieldValue.serverTimestamp();
-      } else if (status === 'rejected') {
-        update.estado = 'rechazada';
-      } else {
-        update.estado = 'pending';
-      }
-
-      await ref.set(update, { merge: true });
-      console.log('[webhook] Firestore actualizado =>', complejoId, reservaId, update.estado);
-    } else {
-      console.log('[webhook] sin external_reference o sin FIREBASE_SERVICE_ACCOUNT — omito Firestore');
-    }
-
-    // Importante: devolver 200/201/204 rápido para que MP no reintente
-    return res.status(200).send('ok');
-  } catch (e) {
-    console.error('webhook error', e);
-    // Devolvemos 200 igual para evitar reintentos infinitos (en sandbox)
-    return res.status(200).send('ok');
-  }
-});
+app.use(morgan('tiny'));
 
 const PORT = process.env.PORT || 3000;
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+
+if (!MP_ACCESS_TOKEN) {
+  console.warn('[WARN] MP_ACCESS_TOKEN no está seteado. Setéalo en Render > Environment.');
+}
+
+// Cliente MP
+const mp = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
+
+/** Health / raíz */
+app.get('/', (_req, res) => res.send('OK futbol-mp-backend'));
+app.get('/health', (_req, res) => res.status(200).send('ok'));
+
+/**
+ * Crea preferencia
+ * body: { title, quantity, unit_price, external_reference, notification_url? }
+ */
+app.post('/mp/create-preference', async (req, res) => {
+  try {
+    const {
+      title = 'Reserva',
+      quantity = 1,
+      unit_price = 1000,
+      external_reference,          // ej: ID de tu reserva en Firestore
+      notification_url,            // opcional: si no lo mandás, usa /mp/webhook de este server
+      payer = {}
+    } = req.body || {};
+
+    const pref = new Preference(mp);
+
+    const body = {
+      items: [
+        {
+          id: external_reference || 'booking',
+          title,
+          quantity: Number(quantity) || 1,
+          currency_id: 'ARS',
+          unit_price: Number(unit_price) || 1000
+        }
+      ],
+      payer,
+      external_reference: external_reference || undefined,
+      notification_url:
+        notification_url ||
+        `${process.env.PUBLIC_URL || ''}/mp/webhook`, // tu dominio de Render + /mp/webhook
+      back_urls: {
+        success: `${process.env.PUBLIC_URL || ''}/success`,
+        failure: `${process.env.PUBLIC_URL || ''}/failure`,
+        pending: `${process.env.PUBLIC_URL || ''}/pending`
+      },
+      auto_return: 'approved'
+    };
+
+    const result = await pref.create({ body });
+
+    return res.status(200).json({
+      id: result.id,
+      init_point: result.init_point,               // producción
+      sandbox_init_point: result.sandbox_init_point // pruebas
+    });
+  } catch (err) {
+    console.error('create-preference error:', err);
+    return res.status(500).json({ error: true, message: String(err?.message || err) });
+  }
+});
+
+/**
+ * Webhook de MP
+ * MP pega con: ?type=payment&data.id=########
+ */
+app.post('/mp/webhook', async (req, res) => {
+  try {
+    // MP manda info por querystring (type, data.id) y también firma el body para otros eventos
+    const { type, 'data.id': dataId } = { ...req.query, ...req.body?.data };
+
+    console.log('[WEBHOOK] query:', req.query);
+    console.log('[WEBHOOK] body:', JSON.stringify(req.body));
+
+    // Sólo atendemos pagos
+    const paymentId = req.query?.['data.id'] || dataId;
+    if (String(type).toLowerCase() === 'payment' && paymentId) {
+      const payment = new Payment(mp);
+      const info = await payment.get({ id: paymentId });
+
+      // info.status puede ser 'approved', 'rejected', 'in_process'
+      console.log('[PAYMENT]', {
+        id: info.id,
+        status: info.status,
+        external_reference: info.external_reference,
+        transaction_amount: info.transaction_amount
+      });
+
+      // 👉 Acá es donde vos deberías:
+      // - actualizar la reserva en Firestore a "confirmada" si status === 'approved'
+      // - o marcarla según corresponda
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('webhook error:', err);
+    // MP quiere 200 siempre para no reintentar indefinidamente; si querés, logueá el error.
+    res.sendStatus(200);
+  }
+});
+
+// Puesto en marcha
 app.listen(PORT, () => {
-  console.log(`MP backend listening on port ${PORT}`);
+  console.log(`MP backend listening on :${PORT}`);
 });
