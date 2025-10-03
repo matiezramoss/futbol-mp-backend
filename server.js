@@ -1,136 +1,149 @@
 // server.js
-import express from "express";
-import cors from "cors";
-import fetch from "node-fetch";
-import admin from "firebase-admin";
-import dotenv from "dotenv";
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
 
-dotenv.config();
+// SDK v2
+import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 
 const app = express();
-app.use(express.json());
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
+app.use(cors({
+  origin: '*', // si querés restringir: ['https://TU-APP.com', 'exp://...']
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('tiny'));
 
-// ======================= FIREBASE ADMIN =======================
-if (!admin.apps.length) {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-}
-const db = admin.firestore();
-
-// ======================= MERCADOPAGO CONFIG ===================
+const PORT = process.env.PORT || 3000;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const USE_MP_PROD = String(process.env.USE_MP_PROD).toLowerCase() === "true";
-const PUBLIC_URL = process.env.PUBLIC_URL || "https://futbol-mp-backend.onrender.com";
+const PUBLIC_URL = process.env.PUBLIC_URL || ''; // ej: https://futbol-mp-backend.onrender.com
+const DEFAULT_DEPOSIT_PCT = Number(process.env.DEPOSIT_PCT || 30); // % por defecto para señas
 
-// Health
-app.get("/health", (req, res) => res.send("ok"));
+if (!MP_ACCESS_TOKEN) {
+  console.warn('[WARN] MP_ACCESS_TOKEN no está seteado. Setealo en Render > Environment.');
+}
 
-// ======================= CREATE PREFERENCE ===================
-app.post("/mp/create-preference", async (req, res) => {
+const mp = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
+
+/** Root / health */
+app.get('/', (_req, res) => res.send('OK futbol-mp-backend'));
+app.get('/health', (_req, res) => res.status(200).send('ok'));
+
+/**
+ * Crea preferencia
+ * Request JSON:
+ * {
+ *   title, quantity, unit_price, external_reference,
+ *   payer, deposit_pct
+ * }
+ *
+ * - unit_price: precio TOTAL de la cancha (en pesos, sin separadores) p.ej. 31870
+ * - deposit_pct: 30 para seña 30%, 100 para total. Si no viene, usa DEFAULT_DEPOSIT_PCT
+ */
+app.post('/mp/create-preference', async (req, res) => {
   try {
-    const { title, quantity, unit_price, external_reference, payer } = req.body;
+    const {
+      title = 'Reserva',
+      quantity = 1,
+      unit_price = 0,             // precio TOTAL de la cancha
+      external_reference,         // ej: "complejoId|YYYY-MM-DD|tipo|HH:MM"
+      notification_url,           // opcional: por defecto usamos /mp/webhook
+      payer = {},
+      deposit_pct,                // 30 ó 100 (o lo que mandes)
+    } = req.body || {};
 
+    // Normalizamos valores
+    const unitPriceNum = Number(unit_price) || 0; // TOTAL en pesos
+    const pct = Number.isFinite(Number(deposit_pct))
+      ? Math.max(1, Math.min(100, Number(deposit_pct)))
+      : Math.max(1, Math.min(100, DEFAULT_DEPOSIT_PCT));
+
+    // 💰 Este es el **monto que se va a cobrar**: seña o total
+    const chargeAmount = Math.round(unitPriceNum * pct / 100);
+
+    // Etiquetas claras en el título según el % que se está cobrando
+    const titleWithPct = pct === 100
+      ? `${title} — Total`
+      : `${title} — Seña ${pct}%`;
+
+    const pref = new Preference(mp);
     const body = {
       items: [
         {
-          title: title || "Reserva",
-          quantity: quantity || 1,
-          currency_id: "ARS",
-          unit_price: Number(unit_price),
-        },
+          id: external_reference || 'booking',
+          title: titleWithPct,
+          quantity: Number(quantity) || 1,
+          currency_id: 'ARS',
+          unit_price: chargeAmount, // 👈 COBRAMOS EL MONTO CALCULADO (seña o total)
+        }
       ],
-      payer: payer || {},
-      external_reference,
-      back_urls: {
-        success: `${PUBLIC_URL}/mp/success`,
-        failure: `${PUBLIC_URL}/mp/failure`,
-        pending: `${PUBLIC_URL}/mp/pending`,
-      },
-      auto_return: "approved",
-      notification_url: `${PUBLIC_URL}/mp/webhook`,
+      payer,
+      external_reference: external_reference || undefined,
+      notification_url: notification_url || (PUBLIC_URL ? `${PUBLIC_URL}/mp/webhook` : undefined),
+      back_urls: PUBLIC_URL
+        ? {
+            success: `${PUBLIC_URL}/success`,
+            failure: `${PUBLIC_URL}/failure`,
+            pending: `${PUBLIC_URL}/pending`,
+          }
+        : undefined,
+      auto_return: 'approved',
     };
 
-    const resp = await fetch("https://api.mercadopago.com/checkout/preferences", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-      },
-      body: JSON.stringify(body),
+    const result = await pref.create({ body });
+
+    return res.status(200).json({
+      id: result.id,
+      init_point: result.init_point,
+      sandbox_init_point: result.sandbox_init_point,
+      charged_amount: chargeAmount,  // (info útil para debug)
+      pct_applied: pct,              // (info útil para debug)
     });
-
-    const data = await resp.json();
-    if (!resp.ok) {
-      console.error("MP create error:", data);
-      return res.status(400).json({ error: true, message: data });
-    }
-
-    return res.json(data);
-  } catch (e) {
-    console.error("create-preference fail", e);
-    res.status(500).json({ error: true, message: e.message });
+  } catch (err) {
+    console.error('create-preference error:', err);
+    return res
+      .status(500)
+      .json({ error: true, message: String(err?.message || err) });
   }
 });
 
-// ======================= WEBHOOK ===================
-app.post("/mp/webhook", async (req, res) => {
+/**
+ * Webhook de MP
+ * MP pega con: ?type=payment&data.id=########
+ * Acá confirmás pagos y actualizás en tu Firestore (si corresponde).
+ */
+app.post('/mp/webhook', async (req, res) => {
   try {
-    const { type, data } = req.body;
+    const { type, 'data.id': dataId } = { ...req.query, ...req.body?.data };
 
-    if (type === "payment") {
-      const paymentId = data.id;
+    console.log('[WEBHOOK] query:', req.query);
+    console.log('[WEBHOOK] body:', JSON.stringify(req.body));
 
-      // Buscar info del pago
-      const resp = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-        headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+    const paymentId = req.query?.['data.id'] || dataId;
+    if (String(type).toLowerCase() === 'payment' && paymentId) {
+      const payment = new Payment(mp);
+      const info = await payment.get({ id: paymentId });
+
+      // info.status: 'approved', 'rejected', 'in_process'
+      console.log('[PAYMENT]', {
+        id: info.id,
+        status: info.status,
+        external_reference: info.external_reference,
+        transaction_amount: info.transaction_amount,
       });
-      const pago = await resp.json();
 
-      if (pago.status === "approved") {
-        const externalRef = pago.external_reference; // acá viene tu reserva
-        const amount = pago.transaction_amount;
-
-        // externalRef = complejoId|fecha|hora|tipo|uid  (ejemplo de convención)
-        const [complejoId, fecha, hora, tipo, uid] = (externalRef || "").split("|");
-
-        if (complejoId && fecha && hora && tipo && uid) {
-          const reservaRef = db.collection("complejos").doc(complejoId).collection("reservas").doc();
-
-          await reservaRef.set({
-            fecha,
-            hora,
-            tipo: Number(tipo),
-            estado: "confirmada",
-            channel: "mp",
-            createdBy: uid,
-            price: amount,
-            paymentId,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          console.log("Reserva creada por webhook ✅", reservaRef.id);
-        } else {
-          console.warn("External reference inválido:", externalRef);
-        }
-      }
-
-      if (pago.status === "rejected") {
-        console.log("Pago rechazado, nada que crear");
-      }
+      // 👉 TODO (si querés): confirmar reserva en Firestore cuando status === 'approved'
+      // usando info.external_reference (p. ej. complejoId|fecha|tipo|hora)
     }
 
+    // MP prefiere 200 siempre.
     res.sendStatus(200);
-  } catch (e) {
-    console.error("Webhook error:", e);
-    res.sendStatus(500);
+  } catch (err) {
+    console.error('webhook error:', err);
+    res.sendStatus(200);
   }
 });
 
-// ===================================================
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`MP backend listening on :${PORT}`);
 });
