@@ -4,70 +4,69 @@ import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 
-// SDK v2 MP
+// MP SDK v2
 import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 
-// Expo Push
-import { Expo } from 'expo-server-sdk';
-
-// Firebase Admin (para Firestore server-side)
+// Firebase Admin (para buscar admins y tokens)
 import admin from 'firebase-admin';
 
 const app = express();
-app.use(cors());
+
+// CORS (permití tu app o * si querés abierto mientras desarrollás)
+const ALLOWED = process.env.ALLOWED_ORIGIN || '*';
+app.use(cors({ origin: ALLOWED }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
 const PORT = process.env.PORT || 3000;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const PUBLIC_URL = process.env.PUBLIC_URL || ''; // tu dominio render, ej: https://futbol-mp-backend.onrender.com
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
-const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL;
-const FIREBASE_PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
-
-// ===== Validaciones mínimas =====
 if (!MP_ACCESS_TOKEN) {
-  console.warn('[WARN] MP_ACCESS_TOKEN no está seteado. Setéalo en Render > Environment.');
+  console.warn('[WARN] MP_ACCESS_TOKEN no está seteado.');
 }
-if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
-  console.warn('[WARN] Credenciales Firebase Admin no seteadas (FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY)');
-}
+const PUBLIC_URL = process.env.PUBLIC_URL || 'https://futbol-mp-backend.onrender.com';
 
-// ===== MP Cliente =====
-const mp = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
-
-// ===== Firebase Admin init (idempotente) =====
+// Inicializar Firebase Admin (si no estaba)
 if (!admin.apps.length) {
   try {
+    const svc = process.env.FIREBASE_SERVICE_ACCOUNT
+      ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+      : null;
     admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: FIREBASE_PROJECT_ID,
-        clientEmail: FIREBASE_CLIENT_EMAIL,
-        privateKey: FIREBASE_PRIVATE_KEY,
-      }),
+      credential: svc ? admin.credential.cert(svc) : admin.credential.applicationDefault(),
     });
-    console.log('[FB-ADMIN] inicializado');
   } catch (e) {
-    console.error('[FB-ADMIN] init error:', e);
+    console.error('[FIREBASE ADMIN] init error:', e);
   }
 }
-const fdb = admin.firestore();
+const fs = admin.firestore();
 
-// ===== Expo Push =====
-const expo = new Expo();
+// MP client
+const mp = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
 
-// Health
+/** Health / raíz */
 app.get('/', (_req, res) => res.send('OK futbol-mp-backend'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
 /**
- * POST /mp/create-preference
- * body: {
- *   title, quantity, unit_price, external_reference,
- *   payer,
- *   pct  // porcentaje opcional (ej 30 para cobrar seña), si no viene cobra total
- *   metadata: { complejoId, complejoName, fecha, hora, tipo, userId }
- * }
+ * Helper: enviar push por Expo
+ * Requiere dev build / app instalada en el dispositivo donde está ese token
+ */
+async function sendExpoPush({ to, title, body, data = {} }) {
+  if (!to) return;
+  const payload = { to, title, body, data, sound: 'default' };
+  const resp = await fetch('https://exp.host/--/api/v2/push/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  try { console.log('[PUSH]', await resp.json()); } catch {}
+}
+
+/**
+ * Crea preferencia
+ * body: { title, quantity, unit_price, external_reference, notification_url?, payer?, payFull?, deposit_pct? }
+ * - Si payFull === true => cobra unit_price
+ * - Si payFull === false => cobra (unit_price * deposit_pct / 100)
  */
 app.post('/mp/create-preference', async (req, res) => {
   try {
@@ -75,16 +74,15 @@ app.post('/mp/create-preference', async (req, res) => {
       title = 'Reserva',
       quantity = 1,
       unit_price = 1000,
-      external_reference,     // ej: "userId|YYYY-MM-DD|tipo|HH:MM" (legacy)
+      external_reference,
+      notification_url,
       payer = {},
-      pct,                    // si viene ej 30 => cobra % del unit_price
-      metadata = {},          // COMPLEJO y detalle para el webhook
+      payFull = false,
+      deposit_pct = 30,
     } = req.body || {};
 
-    const chargedUnitPrice =
-      typeof pct === 'number' && pct > 0
-        ? Math.round((Number(unit_price) || 0) * pct / 100)
-        : Number(unit_price) || 0;
+    const baseAmount = Number(unit_price) || 0;
+    const charged = payFull ? baseAmount : Math.round((baseAmount * deposit_pct) / 100);
 
     const pref = new Preference(mp);
     const body = {
@@ -93,29 +91,40 @@ app.post('/mp/create-preference', async (req, res) => {
           title,
           quantity: Number(quantity) || 1,
           currency_id: 'ARS',
-          unit_price: chargedUnitPrice,
+          unit_price: charged,
         },
       ],
       payer,
       external_reference: external_reference || undefined,
-      metadata, // 👈 importante para el webhook (complejoId, etc.)
-      notification_url: `${PUBLIC_URL}/mp/webhook`,
+      // back_urls a tu backend (pueden redirigir a pantallas de éxito si querés)
       back_urls: {
         success: `${PUBLIC_URL}/mp/success`,
         failure: `${PUBLIC_URL}/mp/failure`,
         pending: `${PUBLIC_URL}/mp/pending`,
       },
       auto_return: 'approved',
+      notification_url: notification_url || `${PUBLIC_URL}/mp/webhook`,
+      // Metadata para auditoría
+      metadata: {
+        base_price: baseAmount,
+        payFull,
+        deposit_pct,
+        charged_amount: charged,
+      },
+      additional_info: `charged=${charged}; payFull=${payFull}; deposit_pct=${deposit_pct}`,
+      payment_methods: {
+        // ejemplo: excluir ATM y pay_on_delivery
+        excluded_payment_types: [{ id: 'atm' }],
+      },
     };
 
     const result = await pref.create({ body });
-
     return res.status(200).json({
       id: result.id,
       init_point: result.init_point,
       sandbox_init_point: result.sandbox_init_point,
-      charged_amount: chargedUnitPrice * (Number(quantity) || 1),
-      pct_applied: typeof pct === 'number' ? pct : null,
+      charged_amount: charged,
+      pct_applied: payFull ? 100 : deposit_pct,
     });
   } catch (err) {
     console.error('create-preference error:', err);
@@ -124,161 +133,85 @@ app.post('/mp/create-preference', async (req, res) => {
 });
 
 /**
- * Helper: crear/actualizar reserva en Firestore cuando MP aprueba
- * El documento se guarda en: complejos/{complejoId}/reservas/{autoID}
- */
-async function upsertReservaApproved({ meta, paymentInfo }) {
-  const {
-    complejoId,
-    complejoName,
-    fecha,
-    hora,
-    tipo,
-    userId,
-    fullName,
-    phone,
-    email,
-  } = meta || {};
-
-  if (!complejoId || !fecha || !hora || !tipo) {
-    console.warn('[RESERVA] Faltan datos clave en metadata, no se crea reserva.', meta);
-    return null;
-  }
-
-  const key = `${fecha}|${tipo}|${hora}`;
-  const col = fdb.collection('complejos').doc(complejoId).collection('reservas');
-  const docRef = col.doc(); // auto-id
-
-  const payload = {
-    key,
-    fecha,
-    tipo: Number(tipo) || tipo,
-    hora,
-    userId: userId || null,
-    estado: 'confirmada',         // aprobado => confirmada (ocupa cupo)
-    channel: 'online',
-    createdBy: userId || null,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    fullName: fullName || null,
-    phone: phone || null,
-    email: email || null,
-    complejoName: complejoName || null,
-    mpPaymentId: paymentInfo?.id || null,
-    mpStatus: paymentInfo?.status || null,
-    mpTotalPaid: paymentInfo?.transaction_amount || null,
-  };
-
-  await docRef.set(payload);
-  return { id: docRef.id, ...payload, complexId: complejoId };
-}
-
-/**
- * Helper: buscar admins del complejo y sus tokens
- */
-async function getAdminPushTokens(complejoId) {
-  const qs = await fdb
-    .collection('users')
-    .where('isAdmin', '==', true)
-    .where('adminOf', 'array-contains', String(complejoId))
-    .get();
-
-  const tokens = [];
-  qs.forEach((d) => {
-    const t = d.data()?.expoPushToken;
-    if (typeof t === 'string' && t.startsWith('ExponentPushToken')) {
-      tokens.push({ token: t, userId: d.id });
-    }
-  });
-  return tokens;
-}
-
-/**
- * Helper: enviar notificaciones vía Expo
- */
-async function sendExpoPush({ tokens, title, body, data }) {
-  if (!tokens?.length) return;
-
-  const messages = tokens.map(({ token }) => ({
-    to: token,
-    sound: 'default',
-    title,
-    body,
-    data,
-  }));
-
-  const chunks = expo.chunkPushNotifications(messages);
-  for (const chunk of chunks) {
-    try {
-      const receipts = await expo.sendPushNotificationsAsync(chunk);
-      console.log('[PUSH] receipts:', receipts);
-    } catch (e) {
-      console.error('[PUSH] error sending chunk:', e);
-    }
-  }
-}
-
-/**
- * Webhook MP
- * MP llama con ?type=payment&data.id=########
+ * Webhook de MP (payment events)
+ * MP pega con: ?type=payment&data.id=########
  */
 app.post('/mp/webhook', async (req, res) => {
   try {
-    const { type } = req.query || {};
-    const paymentId = req.query?.['data.id'] || req.body?.data?.id || req.body?.['data.id'];
+    const { type, 'data.id': dataId } = { ...req.query, ...req.body?.data };
+    const paymentId = req.query?.['data.id'] || dataId;
 
     console.log('[WEBHOOK] query:', req.query);
-    console.log('[WEBHOOK] body:', JSON.stringify(req.body));
+    console.log('[WEBHOOK] body:', JSON.stringify(req.body || {}));
 
-    if (String(type).toLowerCase() !== 'payment' || !paymentId) {
-      // no es un pago, respondemos 200 igual para frenar reintentos
-      return res.sendStatus(200);
-    }
+    if (String(type).toLowerCase() === 'payment' && paymentId) {
+      const payment = new Payment(mp);
+      const info = await payment.get({ id: paymentId });
 
-    const payment = new Payment(mp);
-    const info = await payment.get({ id: paymentId });
-
-    console.log('[PAYMENT]', {
-      id: info.id,
-      status: info.status,
-      external_reference: info.external_reference,
-      transaction_amount: info.transaction_amount,
-      metadata: info.metadata,
-    });
-
-    if (info.status === 'approved') {
-      // Creamos/actualizamos la reserva...
-      const reserva = await upsertReservaApproved({
-        meta: info.metadata || {},
-        paymentInfo: info,
+      console.log('[PAYMENT]', {
+        id: info.id,
+        status: info.status,
+        external_reference: info.external_reference,
+        transaction_amount: info.transaction_amount,
+        metadata: info.metadata,
       });
 
-      // ...y si tenemos complejoId, notificamos admins
-      const complejoId = info.metadata?.complejoId;
-      if (complejoId) {
-        const tokens = await getAdminPushTokens(complejoId);
-        if (tokens.length) {
-          await sendExpoPush({
-            tokens,
-            title: 'Nueva reserva acreditada',
-            body: `${info.metadata?.complejoName || 'Tu complejo'} — ${info.metadata?.fecha} ${info.metadata?.hora} (F${info.metadata?.tipo})`,
-            data: {
-              type: 'booking_approved',
-              complejoId,
-              fecha: info.metadata?.fecha,
-              hora: info.metadata?.hora,
-              tipo: info.metadata?.tipo,
-            },
-          });
+      if (info.status === 'approved') {
+        // external_reference viene como: `${complejoId}|${fecha}|${tipo}|${hora}`
+        const complexId = String(info.external_reference || '').split('|')[0];
+
+        // (A) TODO: acá confirmás/creás la reserva en Firestore (tu lógica)
+        // ...
+
+        // (B) Enviamos push a admins del complejo (si hay tokens)
+        try {
+          if (complexId) {
+            const qs = await fs
+              .collection('users')
+              .where('isAdmin', '==', true)
+              .where('adminOf', 'array-contains', complexId)
+              .get();
+
+            const tokens = [];
+            qs.forEach(d => {
+              const t = d.data()?.pushToken;
+              if (t) tokens.push(t);
+            });
+
+            await Promise.all(
+              tokens.map(t =>
+                sendExpoPush({
+                  to: t,
+                  title: 'Nueva reserva',
+                  body: `Pago aprobado (${info.transaction_amount}) — ${info.external_reference}`,
+                  data: {
+                    type: 'booking-approved',
+                    external_reference: info.external_reference,
+                    payment_id: info.id,
+                    amount: info.transaction_amount,
+                  },
+                })
+              )
+            );
+          }
+        } catch (e) {
+          console.error('push admins error:', e);
         }
       }
     }
 
+    // MP espera 200 siempre para evitar reintentos infinitos
     res.sendStatus(200);
   } catch (err) {
     console.error('webhook error:', err);
-    res.sendStatus(200); // MP prefiere 200 para cortar reintentos
+    res.sendStatus(200);
   }
 });
+
+// Endpoints simples para redirecciones (opcionales)
+app.get('/mp/success', (_req, res) => res.send('Pago aprobado'));
+app.get('/mp/failure', (_req, res) => res.send('Pago fallido'));
+app.get('/mp/pending', (_req, res) => res.send('Pago pendiente'));
 
 // Start
 app.listen(PORT, () => {
