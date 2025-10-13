@@ -55,7 +55,7 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
  *   complejoId, name, fecha, hora, tipo, priceNum, userId, userEmail
  * }
  *
- * CAMBIO: se suma comisión fija de $950 al monto cobrado en MP (visible para el usuario).
+ * CAMBIO: se suma comisión fija de $1000 al monto cobrado en MP (visible para el usuario).
  */
 app.post('/mp/create-preference', async (req, res) => {
   try {
@@ -81,7 +81,7 @@ app.post('/mp/create-preference', async (req, res) => {
     } = req.body || {};
 
     // ===== Comisión fija =====
-    const COMMISSION_FIXED = 950;
+    const COMMISSION_FIXED = 1000;
 
     // base de la reserva (precio que llega desde tu app)
     const base = Number(unit_price) || 0;
@@ -105,7 +105,7 @@ app.post('/mp/create-preference', async (req, res) => {
           title,
           quantity: Number(quantity) || 1,
           currency_id: 'ARS',
-          unit_price: chargedAmount, // 👈 lo que ve y paga el usuario (con $950 incluidos)
+          unit_price: chargedAmount, // 👈 lo que ve y paga el usuario (con $1000 incluidos)
         },
       ],
       payer,
@@ -125,7 +125,7 @@ app.post('/mp/create-preference', async (req, res) => {
         // desglose de importes
         basePrice: base,                     // precio base de la reserva (sin comisión)
         base_fraction_amount: baseFractionAmount, // seña o total (según payFull)
-        commission_fixed: COMMISSION_FIXED,  // $950 fijos
+        commission_fixed: COMMISSION_FIXED,  // $1000 fijos
         total: chargedAmount,                // lo que se cobra en MP
 
         // extras opcionales para tracking
@@ -210,7 +210,7 @@ app.post('/mp/webhook', async (req, res) => {
             const docRef = snap.docs[0].ref;
 
             const m = info?.metadata || {};
-            const COMMISSION_FALLBACK = 950;
+            const COMMISSION_FALLBACK = 1000;
 
             await docRef.set(
               {
@@ -226,7 +226,7 @@ app.post('/mp/webhook', async (req, res) => {
                   amount: info.transaction_amount, // lo que cobró MP (== total)
                   amount_base: m.basePrice ?? null,                // base (sin comisión)
                   amount_base_fraction: m.base_fraction_amount ?? null, // seña/total sin comisión
-                  commission: m.commission_fixed ?? COMMISSION_FALLBACK, // $950 fijos
+                  commission: m.commission_fixed ?? COMMISSION_FALLBACK, // $1000 fijos
                   amount_total: m.total ?? info.transaction_amount, // total cobrado (con comisión)
 
                   // modalidad
