@@ -10,12 +10,11 @@ import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 // PDF
 import PDFDocument from 'pdfkit';
 
-// Firebase Admin (para leer la reserva al generar el PDF)
+// Firebase Admin
 import admin from 'firebase-admin';
 
 try {
   if (!admin.apps.length) {
-    // Inicializa con credenciales por defecto (Render/GCP) o variables
     admin.initializeApp({
       credential: admin.credential.applicationDefault(),
     });
@@ -33,6 +32,7 @@ app.use(morgan('tiny'));
 
 const PORT = process.env.PORT || 3000;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const PUBLIC_URL = process.env.PUBLIC_URL || '';
 
 if (!MP_ACCESS_TOKEN) {
   console.warn('[WARN] MP_ACCESS_TOKEN no está seteado. Setéalo en Render > Environment.');
@@ -50,8 +50,12 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
  * body: {
  *   title, quantity, unit_price, external_reference,
  *   payFull?: boolean, deposit_pct?: number,
- *   payer?, notification_url?
+ *   payer?, notification_url?,
+ *   // opcionales (si los mandás, los guardo en metadata):
+ *   complejoId, name, fecha, hora, tipo, priceNum, userId, userEmail
  * }
+ *
+ * CAMBIO: se suma comisión fija de $950 al monto cobrado en MP (visible para el usuario).
  */
 app.post('/mp/create-preference', async (req, res) => {
   try {
@@ -59,18 +63,38 @@ app.post('/mp/create-preference', async (req, res) => {
       title = 'Reserva',
       quantity = 1,
       unit_price = 1000,
-      external_reference,          // ej: `${complejoId}|${fecha}|${tipo}|${hora}`
-      notification_url,            // opcional: si no lo mandás, usa /mp/webhook de este server
+      external_reference, // ej: `${complejoId}|${fecha}|${tipo}|${hora}`
+      notification_url,   // opcional (si no viene, uso /mp/webhook)
       payer = {},
       payFull = false,
-      deposit_pct = 30,            // si payFull === false, % a cobrar
+      deposit_pct = 30,
+
+      // extras que podés mandar desde tu app (los dejo en metadata)
+      complejoId,
+      name,
+      fecha,
+      hora,
+      tipo,
+      priceNum,
+      userId,
+      userEmail,
     } = req.body || {};
 
-    // monto a cobrar
+    // ===== Comisión fija =====
+    const COMMISSION_FIXED = 950;
+
+    // base de la reserva (precio que llega desde tu app)
     const base = Number(unit_price) || 0;
-    const charged = payFull ? base : Math.round((base * (deposit_pct || 30)) ) / 100; // centavos (ARS usa 2 decimales)
-    // Importante: Mercado Pago en ARS espera número en peso con decimales (Number), no centavos enteros.
-    const chargedAmount = Number((base * (payFull ? 1 : (deposit_pct/100))).toFixed(2));
+
+    // si hay seña, cobramos sólo una fracción de la base, pero igual sumamos la comisión fija
+    const pct = Number(deposit_pct) || 30;
+    const fraction = payFull ? 1 : (pct / 100);
+
+    // monto correspondiente a la reserva (según seña o pago total)
+    const baseFractionAmount = Number((base * fraction).toFixed(2));
+
+    // monto final a cobrar en MP = fracción de base + comisión fija
+    const chargedAmount = Number((baseFractionAmount + COMMISSION_FIXED).toFixed(2));
 
     const pref = new Preference(mp);
 
@@ -81,23 +105,38 @@ app.post('/mp/create-preference', async (req, res) => {
           title,
           quantity: Number(quantity) || 1,
           currency_id: 'ARS',
-          unit_price: chargedAmount
-        }
+          unit_price: chargedAmount, // 👈 lo que ve y paga el usuario (con $950 incluidos)
+        },
       ],
       payer,
       external_reference: external_reference || undefined,
-      notification_url:
-        notification_url ||
-        `${process.env.PUBLIC_URL || ''}/mp/webhook`,
+      notification_url: notification_url || `${PUBLIC_URL}/mp/webhook`,
       back_urls: {
-        success: `${process.env.PUBLIC_URL || ''}/mp/success`,
-        failure: `${process.env.PUBLIC_URL || ''}/mp/failure`,
-        pending: `${process.env.PUBLIC_URL || ''}/mp/pending`
+        success: `${PUBLIC_URL}/mp/success`,
+        failure: `${PUBLIC_URL}/mp/failure`,
+        pending: `${PUBLIC_URL}/mp/pending`,
       },
       auto_return: 'approved',
       metadata: {
+        // modalización
         payFull: !!payFull,
-        deposit_pct: payFull ? null : Number(deposit_pct) || 30,
+        deposit_pct: payFull ? null : pct,
+
+        // desglose de importes
+        basePrice: base,                     // precio base de la reserva (sin comisión)
+        base_fraction_amount: baseFractionAmount, // seña o total (según payFull)
+        commission_fixed: COMMISSION_FIXED,  // $950 fijos
+        total: chargedAmount,                // lo que se cobra en MP
+
+        // extras opcionales para tracking
+        complejoId,
+        name,
+        fecha,
+        hora,
+        tipo,
+        priceNum,
+        userId,
+        userEmail,
       },
     };
 
@@ -107,19 +146,25 @@ app.post('/mp/create-preference', async (req, res) => {
       id: result.id,
       init_point: result.init_point,
       sandbox_init_point: result.sandbox_init_point,
-      pct_applied: payFull ? 100 : (Number(deposit_pct) || 30),
-      charged_amount: chargedAmount,
+      pct_applied: payFull ? 100 : pct,
+      charged_amount: chargedAmount, // 👈 monto final con comisión
+      base_fraction_amount: baseFractionAmount,
+      commission_fixed: COMMISSION_FIXED,
     });
   } catch (err) {
     console.error('create-preference error:', err);
-    return res.status(500).json({ error: true, message: String(err?.message || err) });
+    return res
+      .status(500)
+      .json({ error: true, message: String(err?.message || err) });
   }
 });
 
 /**
  * Webhook de MP
  * MP pega con: ?type=payment&data.id=########
- * Acá confirmás la reserva en Firestore cuando el pago está approved.
+ * Confirmamos reserva en Firestore cuando el pago está approved.
+ *
+ * CAMBIO: guardamos en `pago` el desglose (base / fracción / comisión / total).
  */
 app.post('/mp/webhook', async (req, res) => {
   try {
@@ -138,18 +183,21 @@ app.post('/mp/webhook', async (req, res) => {
         id: info.id,
         status: info.status,
         external_reference: info.external_reference,
-        transaction_amount: info.transaction_amount
+        transaction_amount: info.transaction_amount,
       });
 
       if (info.status === 'approved') {
-        // >>>> EJEMPLO de confirmación de reserva (ajustá a tu estructura real)
         // external_reference = `${complejoId}|${fecha}|${tipo}|${hora}`
         const ref = String(info.external_reference || '');
         const [complejoId, fecha, tipo, hora] = ref.split('|');
 
         if (complejoId && fecha && tipo && hora) {
-          // Buscamos la reserva "pendiente" de ese slot y la confirmamos
-          const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
+          // buscamos la reserva pendiente y la confirmamos
+          const reservasRef = db
+            .collection('complejos')
+            .doc(complejoId)
+            .collection('reservas');
+
           const snap = await reservasRef
             .where('fecha', '==', fecha)
             .where('tipo', '==', Number(tipo))
@@ -160,21 +208,36 @@ app.post('/mp/webhook', async (req, res) => {
 
           if (!snap.empty) {
             const docRef = snap.docs[0].ref;
+
+            const m = info?.metadata || {};
+            const COMMISSION_FALLBACK = 950;
+
             await docRef.set(
               {
                 estado: 'confirmada',
                 pago: {
                   mp_payment_id: info.id,
-                  amount: info.transaction_amount,
                   status: info.status,
-                  date_approved: info.date_approved || admin.firestore.FieldValue.serverTimestamp(),
-                  payFull: info.metadata?.payFull ?? null,
-                  deposit_pct: info.metadata?.deposit_pct ?? null,
+                  date_approved:
+                    info.date_approved ||
+                    admin.firestore.FieldValue.serverTimestamp(),
+
+                  // montos
+                  amount: info.transaction_amount, // lo que cobró MP (== total)
+                  amount_base: m.basePrice ?? null,                // base (sin comisión)
+                  amount_base_fraction: m.base_fraction_amount ?? null, // seña/total sin comisión
+                  commission: m.commission_fixed ?? COMMISSION_FALLBACK, // $950 fijos
+                  amount_total: m.total ?? info.transaction_amount, // total cobrado (con comisión)
+
+                  // modalidad
+                  payFull: m.payFull ?? null,
+                  deposit_pct: m.deposit_pct ?? null,
                 },
                 updatedAt: admin.firestore.FieldValue.serverTimestamp(),
               },
               { merge: true }
             );
+
             console.log('[WEBHOOK] Reserva confirmada en', docRef.path);
           } else {
             console.log('[WEBHOOK] No se encontró reserva pendiente para', ref);
@@ -200,7 +263,11 @@ app.post('/mp/webhook', async (req, res) => {
  * - Ruta típica: complejos/{complejoId}/reservas/{reservaId}
  */
 async function getReservaDoc({ complejoId, reservaId }) {
-  const ref = db.collection('complejos').doc(complejoId).collection('reservas').doc(reservaId);
+  const ref = db
+    .collection('complejos')
+    .doc(complejoId)
+    .collection('reservas')
+    .doc(reservaId);
   const snap = await ref.get();
   if (!snap.exists) return null;
   return { id: snap.id, ref, data: snap.data() };
@@ -215,7 +282,10 @@ async function findReservaByExternalRef(external_reference) {
   const [complejoId, fecha, tipo, hora] = String(external_reference).split('|');
   if (!complejoId || !fecha || !tipo || !hora) return null;
 
-  const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
+  const reservasRef = db
+    .collection('complejos')
+    .doc(complejoId)
+    .collection('reservas');
   const q = reservasRef
     .where('fecha', '==', fecha)
     .where('tipo', '==', Number(tipo))
@@ -243,10 +313,7 @@ function streamReservaPDF({ res, reserva, complejoId }) {
   doc.pipe(res);
 
   // Header
-  doc
-    .fontSize(18)
-    .text('Comprobante de Reserva', { align: 'center' })
-    .moveDown(0.5);
+  doc.fontSize(18).text('Comprobante de Reserva', { align: 'center' }).moveDown(0.5);
   doc
     .fontSize(10)
     .fillColor('#666')
@@ -277,10 +344,10 @@ function streamReservaPDF({ res, reserva, complejoId }) {
   // Pago (si existe)
   doc.font('Helvetica-Bold').text('Pago', { underline: true }).moveDown(0.2);
   const pago = d.pago || {};
-  kv('Estado del pago', (pago.status || '—'));
-  kv('Importe', pago.amount != null ? `$${Number(pago.amount).toLocaleString('es-AR')}` : '—');
-  if (pago.payFull === true) kv('Modalidad', 'Pago total');
-  else if (pago.deposit_pct != null) kv('Modalidad', `Seña ${pago.deposit_pct}%`);
+  kv('Estado del pago', pago.status || '—');
+  kv('Importe total', pago.amount_total != null ? `$${Number(pago.amount_total).toLocaleString('es-AR')}` : (pago.amount != null ? `$${Number(pago.amount).toLocaleString('es-AR')}` : '—'));
+  if (pago.amount_base_fraction != null) kv('Reserva (según modalidad)', `$${Number(pago.amount_base_fraction).toLocaleString('es-AR')}`);
+  if (pago.commission != null) kv('Comisión YoReservo', `$${Number(pago.commission).toLocaleString('es-AR')}`);
   if (pago.mp_payment_id) kv('MP Payment ID', pago.mp_payment_id);
 
   doc.moveDown(1);
