@@ -24,6 +24,7 @@ try {
 }
 
 const db = admin.firestore();
+const { FieldValue } = admin.firestore;
 
 const app = express();
 app.use(cors());
@@ -33,6 +34,9 @@ app.use(morgan('tiny'));
 const PORT = process.env.PORT || 3000;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const PUBLIC_URL = process.env.PUBLIC_URL || '';
+
+// Comisión fija por transacción (tuya)
+const COMMISSION_FIXED = 1000;
 
 if (!MP_ACCESS_TOKEN) {
   console.warn('[WARN] MP_ACCESS_TOKEN no está seteado. Setéalo en Render > Environment.');
@@ -80,9 +84,6 @@ app.post('/mp/create-preference', async (req, res) => {
       userEmail,
     } = req.body || {};
 
-    // ===== Comisión fija =====
-    const COMMISSION_FIXED = 1000;
-
     // base de la reserva (precio que llega desde tu app)
     const base = Number(unit_price) || 0;
 
@@ -123,10 +124,10 @@ app.post('/mp/create-preference', async (req, res) => {
         deposit_pct: payFull ? null : pct,
 
         // desglose de importes
-        basePrice: base,                     // precio base de la reserva (sin comisión)
+        basePrice: base,                          // precio base de la reserva (sin comisión)
         base_fraction_amount: baseFractionAmount, // seña o total (según payFull)
-        commission_fixed: COMMISSION_FIXED,  // $1000 fijos
-        total: chargedAmount,                // lo que se cobra en MP
+        commission_fixed: COMMISSION_FIXED,       // $1000 fijos
+        total: chargedAmount,                     // lo que se cobra en MP
 
         // extras opcionales para tracking
         complejoId,
@@ -159,12 +160,102 @@ app.post('/mp/create-preference', async (req, res) => {
   }
 });
 
+/* ============================================================
+   Helper: registrar liquidación diaria (idempotente por pago)
+   Ruta: liquidaciones/{complejoId}/days/{YYYY-MM-DD}
+         subcolección pagos/{mp_payment_id}
+   - Suma:
+     * count_total
+     * count_full / count_deposit
+     * sum_total_charged (lo cobrado en MP, con comisión)
+     * sum_commission (tus $1000 por pago)
+     * sum_base_fraction (monto para el complejo por pago)
+     * sum_net_to_complex (== sum_base_fraction)
+   - Flag diario: pagado (default false)
+   ============================================================ */
+async function upsertDailySettlement({ complejoId, fecha, paymentInfo }) {
+  if (!complejoId || !fecha || !paymentInfo) return;
+  const {
+    id: mp_payment_id,
+    status,
+    transaction_amount,   // == total cobrado en MP
+    metadata = {},
+  } = paymentInfo;
+
+  const isFull = !!metadata?.payFull;
+  const commission = Number(metadata?.commission_fixed ?? COMMISSION_FIXED) || COMMISSION_FIXED;
+  const baseFraction = Number(metadata?.base_fraction_amount ?? 0) || 0;
+  const totalCharged = Number(metadata?.total ?? transaction_amount ?? 0) || 0;
+
+  const dayDoc = db.collection('liquidaciones')
+    .doc(String(complejoId))
+    .collection('days')
+    .doc(String(fecha));
+
+  const pagoDoc = dayDoc.collection('pagos').doc(String(mp_payment_id));
+
+  await db.runTransaction(async (tx) => {
+    const pagoSnap = await tx.get(pagoDoc);
+    if (pagoSnap.exists) {
+      // Ya fue contado: salimos (idempotencia)
+      return;
+    }
+
+    // Crear el pago individual
+    tx.set(pagoDoc, {
+      mp_payment_id,
+      status,
+      createdAt: FieldValue.serverTimestamp(),
+      total_charged: totalCharged,      // con comisión incluida
+      commission,                       // $1000
+      base_fraction: baseFraction,      // monto usable por el complejo (seña o total)
+      payFull: isFull,
+      deposit_pct: isFull ? null : (Number(metadata?.deposit_pct ?? 0) || 0),
+    });
+
+    // Inicializar día si no existe
+    const daySnap = await tx.get(dayDoc);
+    if (!daySnap.exists) {
+      tx.set(dayDoc, {
+        complejoId,
+        fecha,                   // YYYY-MM-DD
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+        pagado: false,           // para que lo marques desde la app al transferir
+        pagadoAt: null,
+
+        // agregados
+        count_total: 0,
+        count_full: 0,
+        count_deposit: 0,
+        sum_total_charged: 0,
+        sum_commission: 0,
+        sum_base_fraction: 0,
+        sum_net_to_complex: 0,   // == sum_base_fraction
+      }, { merge: true });
+    }
+
+    // Acumular
+    tx.set(dayDoc, {
+      updatedAt: FieldValue.serverTimestamp(),
+      count_total: FieldValue.increment(1),
+      count_full: FieldValue.increment(isFull ? 1 : 0),
+      count_deposit: FieldValue.increment(isFull ? 0 : 1),
+      sum_total_charged: FieldValue.increment(totalCharged),
+      sum_commission: FieldValue.increment(commission),
+      sum_base_fraction: FieldValue.increment(baseFraction),
+      sum_net_to_complex: FieldValue.increment(baseFraction),
+    }, { merge: true });
+  });
+}
+
 /**
  * Webhook de MP
  * MP pega con: ?type=payment&data.id=########
  * Confirmamos reserva en Firestore cuando el pago está approved.
  *
  * CAMBIO: guardamos en `pago` el desglose (base / fracción / comisión / total).
+ *         y registramos liquidación diaria (acumuladores por día/club).
  */
 app.post('/mp/webhook', async (req, res) => {
   try {
@@ -210,7 +301,6 @@ app.post('/mp/webhook', async (req, res) => {
             const docRef = snap.docs[0].ref;
 
             const m = info?.metadata || {};
-            const COMMISSION_FALLBACK = 1000;
 
             await docRef.set(
               {
@@ -226,8 +316,8 @@ app.post('/mp/webhook', async (req, res) => {
                   amount: info.transaction_amount, // lo que cobró MP (== total)
                   amount_base: m.basePrice ?? null,                // base (sin comisión)
                   amount_base_fraction: m.base_fraction_amount ?? null, // seña/total sin comisión
-                  commission: m.commission_fixed ?? COMMISSION_FALLBACK, // $1000 fijos
-                  amount_total: m.total ?? info.transaction_amount, // total cobrado (con comisión)
+                  commission: m.commission_fixed ?? COMMISSION_FIXED,   // $1000 fijos
+                  amount_total: m.total ?? info.transaction_amount,     // total cobrado (con comisión)
 
                   // modalidad
                   payFull: m.payFull ?? null,
@@ -239,6 +329,13 @@ app.post('/mp/webhook', async (req, res) => {
             );
 
             console.log('[WEBHOOK] Reserva confirmada en', docRef.path);
+
+            // 👇 Registrar/acumular liquidación del día (idempotente)
+            await upsertDailySettlement({
+              complejoId,
+              fecha,        // usamos la fecha de la reserva (YYYY-MM-DD)
+              paymentInfo: info,
+            });
           } else {
             console.log('[WEBHOOK] No se encontró reserva pendiente para', ref);
           }
