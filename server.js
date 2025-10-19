@@ -49,6 +49,50 @@ const mp = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
 app.get('/', (_req, res) => res.send('OK futbol-mp-backend'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
+/* ------------------------------------------------------------------
+   Helper post-pago: render HTML mínimo y deep link a la app
+   ------------------------------------------------------------------ */
+function renderAndDeepLink(res, status, req) {
+  // Reenviamos todos los query params de MP (payment_id, status, etc.)
+  const qs = new URLSearchParams(req.query).toString();
+  const deeplink = `yoreservo://mp-result?status=${encodeURIComponent(status)}${qs ? `&${qs}` : ''}`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.end(`<!doctype html>
+<html>
+<head>
+  <meta http-equiv="refresh" content="0;url='${deeplink}'" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Volviendo a YoReservo…</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:24px;background:#fafafa}
+    .box{max-width:560px;margin:auto;border:1px solid #eee;border-radius:12px;padding:24px;background:#fff}
+    h2{margin:0 0 8px 0}
+    .ok{color:#0a7;font-weight:800}
+    .fail{color:#b00020;font-weight:800}
+    .pend{color:#915f00;font-weight:800}
+    a{color:#0a7;font-weight:700;text-decoration:none}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2 class="${status==='success'?'ok':status==='failure'?'fail':'pend'}">
+      ${status==='success' ? '¡Pago aprobado!'
+        : status==='failure' ? 'Pago rechazado'
+        : 'Pago pendiente'}
+    </h2>
+    <p>Te estamos reenviando a <b>YoReservo</b>…</p>
+    <p>Si no pasa nada, tocá este enlace: <a href="${deeplink}">volver a la app</a></p>
+  </div>
+</body>
+</html>`);
+}
+
+// Endpoints de retorno para evitar 404 y volver a la app
+app.get('/mp/success', (req, res) => renderAndDeepLink(res, 'success', req));
+app.get('/mp/failure', (req, res) => renderAndDeepLink(res, 'failure', req));
+app.get('/mp/pending', (req, res) => renderAndDeepLink(res, 'pending', req));
+
 /**
  * Crea preferencia
  * body: {
@@ -164,14 +208,6 @@ app.post('/mp/create-preference', async (req, res) => {
    Helper: registrar liquidación diaria (idempotente por pago)
    Ruta: liquidaciones/{complejoId}/days/{YYYY-MM-DD}
          subcolección pagos/{mp_payment_id}
-   - Suma:
-     * count_total
-     * count_full / count_deposit
-     * sum_total_charged (lo cobrado en MP, con comisión)
-     * sum_commission (tus $1000 por pago)
-     * sum_base_fraction (monto para el complejo por pago)
-     * sum_net_to_complex (== sum_base_fraction)
-   - Flag diario: pagado (default false)
    ============================================================ */
 async function upsertDailySettlement({ complejoId, fecha, paymentInfo }) {
   if (!complejoId || !fecha || !paymentInfo) return;
@@ -253,9 +289,6 @@ async function upsertDailySettlement({ complejoId, fecha, paymentInfo }) {
  * Webhook de MP
  * MP pega con: ?type=payment&data.id=########
  * Confirmamos reserva en Firestore cuando el pago está approved.
- *
- * CAMBIO: guardamos en `pago` el desglose (base / fracción / comisión / total).
- *         y registramos liquidación diaria (acumuladores por día/club).
  */
 app.post('/mp/webhook', async (req, res) => {
   try {
@@ -330,7 +363,7 @@ app.post('/mp/webhook', async (req, res) => {
 
             console.log('[WEBHOOK] Reserva confirmada en', docRef.path);
 
-            // 👇 Registrar/acumular liquidación del día (idempotente)
+            // Registrar/acumular liquidación del día (idempotente)
             await upsertDailySettlement({
               complejoId,
               fecha,        // usamos la fecha de la reserva (YYYY-MM-DD)
