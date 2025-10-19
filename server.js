@@ -28,14 +28,14 @@ const { FieldValue } = admin.firestore;
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '5mb' }));
 app.use(morgan('tiny'));
 
 const PORT = process.env.PORT || 3000;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const PUBLIC_URL = process.env.PUBLIC_URL || '';
 
-// Comisión fija por transacción (tuya)
+// Comisión fija por transacción (tuya) — para MP
 const COMMISSION_FIXED = 1000;
 
 if (!MP_ACCESS_TOKEN) {
@@ -53,7 +53,6 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
    Helper post-pago: render HTML mínimo y deep link a la app
    ------------------------------------------------------------------ */
 function renderAndDeepLink(res, status, req) {
-  // Reenviamos todos los query params de MP (payment_id, status, etc.)
   const qs = new URLSearchParams(req.query).toString();
   const deeplink = `yoreservo://mp-result?status=${encodeURIComponent(status)}${qs ? `&${qs}` : ''}`;
 
@@ -77,9 +76,7 @@ function renderAndDeepLink(res, status, req) {
 <body>
   <div class="box">
     <h2 class="${status==='success'?'ok':status==='failure'?'fail':'pend'}">
-      ${status==='success' ? '¡Pago aprobado!'
-        : status==='failure' ? 'Pago rechazado'
-        : 'Pago pendiente'}
+      ${status==='success' ? '¡Pago aprobado!' : status==='failure' ? 'Pago rechazado' : 'Pago pendiente'}
     </h2>
     <p>Te estamos reenviando a <b>YoReservo</b>…</p>
     <p>Si no pasa nada, tocá este enlace: <a href="${deeplink}">volver a la app</a></p>
@@ -95,15 +92,6 @@ app.get('/mp/pending', (req, res) => renderAndDeepLink(res, 'pending', req));
 
 /**
  * Crea preferencia
- * body: {
- *   title, quantity, unit_price, external_reference,
- *   payFull?: boolean, deposit_pct?: number,
- *   payer?, notification_url?,
- *   // opcionales (si los mandás, los guardo en metadata):
- *   complejoId, name, fecha, hora, tipo, priceNum, userId, userEmail
- * }
- *
- * CAMBIO: se suma comisión fija de $1000 al monto cobrado en MP (visible para el usuario).
  */
 app.post('/mp/create-preference', async (req, res) => {
   try {
@@ -111,13 +99,13 @@ app.post('/mp/create-preference', async (req, res) => {
       title = 'Reserva',
       quantity = 1,
       unit_price = 1000,
-      external_reference, // ej: `${complejoId}|${fecha}|${tipo}|${hora}`
-      notification_url,   // opcional (si no viene, uso /mp/webhook)
+      external_reference,
+      notification_url,
       payer = {},
       payFull = false,
       deposit_pct = 30,
 
-      // extras que podés mandar desde tu app (los dejo en metadata)
+      // extras
       complejoId,
       name,
       fecha,
@@ -128,17 +116,10 @@ app.post('/mp/create-preference', async (req, res) => {
       userEmail,
     } = req.body || {};
 
-    // base de la reserva (precio que llega desde tu app)
     const base = Number(unit_price) || 0;
-
-    // si hay seña, cobramos sólo una fracción de la base, pero igual sumamos la comisión fija
     const pct = Number(deposit_pct) || 30;
     const fraction = payFull ? 1 : (pct / 100);
-
-    // monto correspondiente a la reserva (según seña o pago total)
     const baseFractionAmount = Number((base * fraction).toFixed(2));
-
-    // monto final a cobrar en MP = fracción de base + comisión fija
     const chargedAmount = Number((baseFractionAmount + COMMISSION_FIXED).toFixed(2));
 
     const pref = new Preference(mp);
@@ -150,7 +131,7 @@ app.post('/mp/create-preference', async (req, res) => {
           title,
           quantity: Number(quantity) || 1,
           currency_id: 'ARS',
-          unit_price: chargedAmount, // 👈 lo que ve y paga el usuario (con $1000 incluidos)
+          unit_price: chargedAmount,
         },
       ],
       payer,
@@ -163,25 +144,15 @@ app.post('/mp/create-preference', async (req, res) => {
       },
       auto_return: 'approved',
       metadata: {
-        // modalización
         payFull: !!payFull,
         deposit_pct: payFull ? null : pct,
 
-        // desglose de importes
-        basePrice: base,                          // precio base de la reserva (sin comisión)
-        base_fraction_amount: baseFractionAmount, // seña o total (según payFull)
-        commission_fixed: COMMISSION_FIXED,       // $1000 fijos
-        total: chargedAmount,                     // lo que se cobra en MP
+        basePrice: base,
+        base_fraction_amount: baseFractionAmount,
+        commission_fixed: COMMISSION_FIXED,
+        total: chargedAmount,
 
-        // extras opcionales para tracking
-        complejoId,
-        name,
-        fecha,
-        hora,
-        tipo,
-        priceNum,
-        userId,
-        userEmail,
+        complejoId, name, fecha, hora, tipo, priceNum, userId, userEmail,
       },
     };
 
@@ -192,36 +163,32 @@ app.post('/mp/create-preference', async (req, res) => {
       init_point: result.init_point,
       sandbox_init_point: result.sandbox_init_point,
       pct_applied: payFull ? 100 : pct,
-      charged_amount: chargedAmount, // 👈 monto final con comisión
+      charged_amount: chargedAmount,
       base_fraction_amount: baseFractionAmount,
       commission_fixed: COMMISSION_FIXED,
     });
   } catch (err) {
     console.error('create-preference error:', err);
-    return res
-      .status(500)
-      .json({ error: true, message: String(err?.message || err) });
+    return res.status(500).json({ error: true, message: String(err?.message || err) });
   }
 });
 
 /* ============================================================
-   Helper: registrar liquidación diaria (idempotente por pago)
-   Ruta: liquidaciones/{complejoId}/days/{YYYY-MM-DD}
-         subcolección pagos/{mp_payment_id}
+   Liquidación diaria (idempotente por pago/operación)
    ============================================================ */
 async function upsertDailySettlement({ complejoId, fecha, paymentInfo }) {
   if (!complejoId || !fecha || !paymentInfo) return;
   const {
     id: mp_payment_id,
     status,
-    transaction_amount,   // == total cobrado en MP
+    transaction_amount,
     metadata = {},
   } = paymentInfo;
 
   const isFull = !!metadata?.payFull;
-  const commission = Number(metadata?.commission_fixed ?? COMMISSION_FIXED) || COMMISSION_FIXED;
-  const baseFraction = Number(metadata?.base_fraction_amount ?? 0) || 0;
-  const totalCharged = Number(metadata?.total ?? transaction_amount ?? 0) || 0;
+  const commission = Number(metadata?.commission_fixed ?? 0) || 0; // 👈 en manual dejamos 0
+  const baseFraction = Number(metadata?.base_fraction_amount ?? metadata?.manual_amount ?? 0) || 0;
+  const totalCharged = Number(metadata?.total ?? transaction_amount ?? baseFraction) || 0;
 
   const dayDoc = db.collection('liquidaciones')
     .doc(String(complejoId))
@@ -232,46 +199,40 @@ async function upsertDailySettlement({ complejoId, fecha, paymentInfo }) {
 
   await db.runTransaction(async (tx) => {
     const pagoSnap = await tx.get(pagoDoc);
-    if (pagoSnap.exists) {
-      // Ya fue contado: salimos (idempotencia)
-      return;
-    }
+    if (pagoSnap.exists) return;
 
-    // Crear el pago individual
     tx.set(pagoDoc, {
       mp_payment_id,
       status,
       createdAt: FieldValue.serverTimestamp(),
-      total_charged: totalCharged,      // con comisión incluida
-      commission,                       // $1000
-      base_fraction: baseFraction,      // monto usable por el complejo (seña o total)
+      total_charged: totalCharged,
+      commission,
+      base_fraction: baseFraction,
       payFull: isFull,
-      deposit_pct: isFull ? null : (Number(metadata?.deposit_pct ?? 0) || 0),
+      deposit_pct: isFull ? null : (Number(metadata?.deposit_pct ?? 0) || null),
+      manual: !!metadata?.manual, // ← marca manual
     });
 
-    // Inicializar día si no existe
     const daySnap = await tx.get(dayDoc);
     if (!daySnap.exists) {
       tx.set(dayDoc, {
         complejoId,
-        fecha,                   // YYYY-MM-DD
+        fecha,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
-        pagado: false,           // para que lo marques desde la app al transferir
+        pagado: false,
         pagadoAt: null,
 
-        // agregados
         count_total: 0,
         count_full: 0,
         count_deposit: 0,
         sum_total_charged: 0,
         sum_commission: 0,
         sum_base_fraction: 0,
-        sum_net_to_complex: 0,   // == sum_base_fraction
+        sum_net_to_complex: 0,
       }, { merge: true });
     }
 
-    // Acumular
     tx.set(dayDoc, {
       updatedAt: FieldValue.serverTimestamp(),
       count_total: FieldValue.increment(1),
@@ -286,14 +247,11 @@ async function upsertDailySettlement({ complejoId, fecha, paymentInfo }) {
 }
 
 /**
- * Webhook de MP
- * MP pega con: ?type=payment&data.id=########
- * Confirmamos reserva en Firestore cuando el pago está approved.
+ * Webhook de MP (sigue igual)
  */
 app.post('/mp/webhook', async (req, res) => {
   try {
     const { type, 'data.id': dataId } = { ...req.query, ...req.body?.data };
-
     console.log('[WEBHOOK] query:', req.query);
     console.log('[WEBHOOK] body:', JSON.stringify(req.body));
 
@@ -302,7 +260,6 @@ app.post('/mp/webhook', async (req, res) => {
       const payment = new Payment(mp);
       const info = await payment.get({ id: paymentId });
 
-      // info.status: 'approved', 'rejected', 'in_process'
       console.log('[PAYMENT]', {
         id: info.id,
         status: info.status,
@@ -311,64 +268,39 @@ app.post('/mp/webhook', async (req, res) => {
       });
 
       if (info.status === 'approved') {
-        // external_reference = `${complejoId}|${fecha}|${tipo}|${hora}`
         const ref = String(info.external_reference || '');
         const [complejoId, fecha, tipo, hora] = ref.split('|');
-
         if (complejoId && fecha && tipo && hora) {
-          // buscamos la reserva pendiente y la confirmamos
-          const reservasRef = db
-            .collection('complejos')
-            .doc(complejoId)
-            .collection('reservas');
-
+          const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
           const snap = await reservasRef
             .where('fecha', '==', fecha)
             .where('tipo', '==', Number(tipo))
             .where('hora', '==', hora)
             .where('estado', 'in', ['pending', 'pendiente'])
-            .limit(1)
-            .get();
+            .limit(1).get();
 
           if (!snap.empty) {
             const docRef = snap.docs[0].ref;
-
             const m = info?.metadata || {};
-
-            await docRef.set(
-              {
-                estado: 'confirmada',
-                pago: {
-                  mp_payment_id: info.id,
-                  status: info.status,
-                  date_approved:
-                    info.date_approved ||
-                    admin.firestore.FieldValue.serverTimestamp(),
-
-                  // montos
-                  amount: info.transaction_amount, // lo que cobró MP (== total)
-                  amount_base: m.basePrice ?? null,                // base (sin comisión)
-                  amount_base_fraction: m.base_fraction_amount ?? null, // seña/total sin comisión
-                  commission: m.commission_fixed ?? COMMISSION_FIXED,   // $1000 fijos
-                  amount_total: m.total ?? info.transaction_amount,     // total cobrado (con comisión)
-
-                  // modalidad
-                  payFull: m.payFull ?? null,
-                  deposit_pct: m.deposit_pct ?? null,
-                },
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            await docRef.set({
+              estado: 'confirmada',
+              pago: {
+                mp_payment_id: info.id,
+                status: info.status,
+                date_approved: info.date_approved || FieldValue.serverTimestamp(),
+                amount: info.transaction_amount,
+                amount_base: m.basePrice ?? null,
+                amount_base_fraction: m.base_fraction_amount ?? null,
+                commission: m.commission_fixed ?? COMMISSION_FIXED,
+                amount_total: m.total ?? info.transaction_amount,
+                payFull: m.payFull ?? null,
+                deposit_pct: m.deposit_pct ?? null,
+                manual: false,
               },
-              { merge: true }
-            );
+              updatedAt: FieldValue.serverTimestamp(),
+            }, { merge: true });
 
-            console.log('[WEBHOOK] Reserva confirmada en', docRef.path);
-
-            // Registrar/acumular liquidación del día (idempotente)
-            await upsertDailySettlement({
-              complejoId,
-              fecha,        // usamos la fecha de la reserva (YYYY-MM-DD)
-              paymentInfo: info,
-            });
+            await upsertDailySettlement({ complejoId, fecha, paymentInfo: info });
           } else {
             console.log('[WEBHOOK] No se encontró reserva pendiente para', ref);
           }
@@ -376,7 +308,6 @@ app.post('/mp/webhook', async (req, res) => {
       }
     }
 
-    // MP prefiere 200 siempre
     res.sendStatus(200);
   } catch (err) {
     console.error('webhook error:', err);
@@ -385,37 +316,21 @@ app.post('/mp/webhook', async (req, res) => {
 });
 
 /* =====================================================================================
-   PDF “on-the-fly” (NO guarda nada): genera y streamea el comprobante de una reserva
+   PDF on-the-fly (igual que ya tenías)
    ===================================================================================== */
-
-/**
- * Helper: devuelve doc de reserva
- * - Ruta típica: complejos/{complejoId}/reservas/{reservaId}
- */
 async function getReservaDoc({ complejoId, reservaId }) {
-  const ref = db
-    .collection('complejos')
-    .doc(complejoId)
-    .collection('reservas')
-    .doc(reservaId);
+  const ref = db.collection('complejos').doc(complejoId).collection('reservas').doc(reservaId);
   const snap = await ref.get();
   if (!snap.exists) return null;
   return { id: snap.id, ref, data: snap.data() };
 }
 
-/**
- * Helper: busca una reserva confirmada a partir de external_reference
- * external_reference = `${complejoId}|${fecha}|${tipo}|${hora}`
- */
 async function findReservaByExternalRef(external_reference) {
   if (!external_reference) return null;
   const [complejoId, fecha, tipo, hora] = String(external_reference).split('|');
   if (!complejoId || !fecha || !tipo || !hora) return null;
 
-  const reservasRef = db
-    .collection('complejos')
-    .doc(complejoId)
-    .collection('reservas');
+  const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
   const q = reservasRef
     .where('fecha', '==', fecha)
     .where('tipo', '==', Number(tipo))
@@ -428,36 +343,23 @@ async function findReservaByExternalRef(external_reference) {
   return { id: d.id, ref: d.ref, data: d.data(), complejoId };
 }
 
-/**
- * Genera el PDF a partir de una reserva y lo streamea
- */
 function streamReservaPDF({ res, reserva, complejoId }) {
   const d = reserva?.data || {};
   const doc = new PDFDocument({ size: 'A4', margin: 48 });
 
-  // Encabezados HTTP
   const fileName = `reserva-${reserva?.id || 'comprobante'}.pdf`;
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="${fileName}"`);
-
   doc.pipe(res);
 
-  // Header
   doc.fontSize(18).text('Comprobante de Reserva', { align: 'center' }).moveDown(0.5);
-  doc
-    .fontSize(10)
-    .fillColor('#666')
+  doc.fontSize(10).fillColor('#666')
     .text(`Complejo: ${d.complejoNombre || d.complejoName || complejoId || '—'}`, { align: 'center' })
     .text(`Reserva ID: ${reserva?.id || '—'}`, { align: 'center' })
     .text(`Fecha de emisión: ${new Date().toLocaleString('es-AR')}`, { align: 'center' })
-    .fillColor('#000')
-    .moveDown(1.2);
+    .fillColor('#000').moveDown(1.2);
 
-  // Datos principales
-  const kv = (k, v) => {
-    doc.font('Helvetica-Bold').text(`${k}: `, { continued: true });
-    doc.font('Helvetica').text(String(v ?? '—'));
-  };
+  const kv = (k, v) => { doc.font('Helvetica-Bold').text(`${k}: `, { continued: true }); doc.font('Helvetica').text(String(v ?? '—')); };
 
   kv('Estado', (d.estado || '').toUpperCase());
   kv('Fecha', d.fecha);
@@ -470,8 +372,6 @@ function streamReservaPDF({ res, reserva, complejoId }) {
   if (d.email) kv('Email', d.email);
 
   doc.moveDown(0.6);
-
-  // Pago (si existe)
   doc.font('Helvetica-Bold').text('Pago', { underline: true }).moveDown(0.2);
   const pago = d.pago || {};
   kv('Estado del pago', pago.status || '—');
@@ -479,26 +379,15 @@ function streamReservaPDF({ res, reserva, complejoId }) {
   if (pago.amount_base_fraction != null) kv('Reserva (según modalidad)', `$${Number(pago.amount_base_fraction).toLocaleString('es-AR')}`);
   if (pago.commission != null) kv('Comisión YoReservo', `$${Number(pago.commission).toLocaleString('es-AR')}`);
   if (pago.mp_payment_id) kv('MP Payment ID', pago.mp_payment_id);
+  if (pago.manual) kv('Carga manual verificada', 'Sí');
 
   doc.moveDown(1);
-
-  // Nota legal
-  doc
-    .fontSize(9)
-    .fillColor('#555')
-    .text(
-      'Este comprobante certifica que la reserva fue registrada como CONFIRMADA según la información provista por el complejo y la plataforma de pago. Conservalo para tu ingreso.',
-      { align: 'left' }
-    )
+  doc.fontSize(9).fillColor('#555')
+    .text('Este comprobante certifica que la reserva fue registrada como CONFIRMADA según la información provista por el complejo y la plataforma de pago. Conservalo para tu ingreso.', { align: 'left' })
     .fillColor('#000');
-
   doc.end();
 }
 
-/**
- * Endpoint 1: PDF por ruta directa
- * GET /receipt/:complejoId/:reservaId.pdf
- */
 app.get('/receipt/:complejoId/:reservaId.pdf', async (req, res) => {
   try {
     const { complejoId, reservaId } = req.params || {};
@@ -512,10 +401,6 @@ app.get('/receipt/:complejoId/:reservaId.pdf', async (req, res) => {
   }
 });
 
-/**
- * Endpoint 2: PDF por external_reference (confirmadas)
- * GET /receipt/by-ref?external_reference=...
- */
 app.get('/receipt/by-ref', async (req, res) => {
   try {
     const { external_reference } = req.query || {};
@@ -529,7 +414,146 @@ app.get('/receipt/by-ref', async (req, res) => {
   }
 });
 
+/* =========================================================================
+   💠 NUEVO: Endpoints isCheck (aprobar / rechazar solicitudes manuales)
+   ========================================================================= */
+async function approveCheckAndConfirmReservation({ checkId, reviewerUid }) {
+  const checkRef = db.collection('checks').doc(checkId);
+  const snap = await checkRef.get();
+  if (!snap.exists) throw new Error('Check no encontrado');
+
+  const c = snap.data() || {};
+  if (c.estado !== 'pending') throw new Error('El check no está pendiente');
+
+  // Esperamos que el check tenga estos campos:
+  // userId, complejoId, fecha(YYYY-MM-DD), hora(HH:mm), tipo(number/string), monto(number), name/email/telefono opcionales
+  const { userId, complejoId, fecha, hora, tipo, monto } = c;
+  if (!userId || !complejoId || !fecha || !hora || !monto) {
+    throw new Error('Datos incompletos en el check');
+  }
+
+  // Creamos/actualizamos una reserva "pending" -> "confirmada"
+  const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
+  const q = await reservasRef
+    .where('fecha', '==', fecha)
+    .where('tipo', '==', (typeof tipo === 'string' ? tipo : Number(tipo)))
+    .where('hora', '==', hora)
+    .where('estado', 'in', ['pending', 'pendiente'])
+    .limit(1)
+    .get();
+
+  let reservaRef;
+  if (!q.empty) {
+    reservaRef = q.docs[0].ref;
+  } else {
+    // Si no existe pendiente, creamos una nueva confirmada por canal "check"
+    reservaRef = reservasRef.doc();
+    await reservaRef.set({
+      key: `${fecha}|${tipo}|${hora}`,
+      fecha,
+      hora,
+      tipo: (typeof tipo === 'string' ? tipo : Number(tipo)),
+      userId,
+      estado: 'confirmada',
+      createdAt: FieldValue.serverTimestamp(),
+      createdBy: reviewerUid || 'check-bot',
+      channel: 'check',
+    }, { merge: true });
+  }
+
+  // Marcar confirmada + pago "manual"
+  await reservaRef.set({
+    estado: 'confirmada',
+    updatedAt: FieldValue.serverTimestamp(),
+    pago: {
+      manual: true,
+      status: 'approved',
+      amount: Number(monto) || 0,
+      amount_base: Number(monto) || 0,
+      amount_base_fraction: Number(monto) || 0,
+      commission: 0,
+      amount_total: Number(monto) || 0,
+      date_approved: FieldValue.serverTimestamp(),
+      payFull: null,
+      deposit_pct: null,
+      mp_payment_id: `manual_${checkId}`,
+    },
+  }, { merge: true });
+
+  // Actualizamos el check a approved
+  await checkRef.set({
+    estado: 'approved',
+    reviewedAt: FieldValue.serverTimestamp(),
+    reviewedBy: reviewerUid || 'check-bot',
+  }, { merge: true });
+
+  // Liquidación diaria (manual)
+  await upsertDailySettlement({
+    complejoId,
+    fecha,
+    paymentInfo: {
+      id: `manual_${checkId}`,
+      status: 'approved',
+      transaction_amount: Number(monto) || 0,
+      metadata: {
+        manual: true,
+        manual_amount: Number(monto) || 0,
+        payFull: null,
+        deposit_pct: null,
+        commission_fixed: 0,
+        total: Number(monto) || 0,
+      },
+    },
+  });
+
+  return { ok: true };
+}
+
+async function rejectCheck({ checkId, reviewerUid, reason }) {
+  const checkRef = db.collection('checks').doc(checkId);
+  const snap = await checkRef.get();
+  if (!snap.exists) throw new Error('Check no encontrado');
+
+  const c = snap.data() || {};
+  if (c.estado !== 'pending') throw new Error('El check no está pendiente');
+
+  await checkRef.set({
+    estado: 'rejected',
+    reviewedAt: FieldValue.serverTimestamp(),
+    reviewedBy: reviewerUid || 'check-bot',
+    reason: reason || 'Rechazado',
+  }, { merge: true });
+
+  return { ok: true };
+}
+
+// Endpoints públicos para la app (confiamos en auth de la app y reglas)
+app.post('/checks/:id/approve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reviewerUid } = req.body || {};
+    const r = await approveCheckAndConfirmReservation({ checkId: id, reviewerUid });
+    res.json(r);
+  } catch (e) {
+    console.error('approve error:', e);
+    res.status(400).json({ error: true, message: String(e?.message || e) });
+  }
+});
+
+app.post('/checks/:id/reject', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reviewerUid, reason } = req.body || {};
+    const r = await rejectCheck({ checkId: id, reviewerUid, reason });
+    res.json(r);
+  } catch (e) {
+    console.error('reject error:', e);
+    res.status(400).json({ error: true, message: String(e?.message || e) });
+  }
+});
+
 // Puesto en marcha
 app.listen(PORT, () => {
   console.log(`MP backend listening on :${PORT}`);
 });
+ 
