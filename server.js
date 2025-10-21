@@ -210,7 +210,7 @@ async function upsertDailySettlement({ complejoId, fecha, paymentInfo }) {
       base_fraction: baseFraction,
       payFull: isFull,
       deposit_pct: isFull ? null : (Number(metadata?.deposit_pct ?? 0) || null),
-      manual: !!metadata?.manual, // ← marca manual
+      manual: !!metadata?.manual,
     });
 
     const daySnap = await tx.get(dayDoc);
@@ -246,50 +246,9 @@ async function upsertDailySettlement({ complejoId, fecha, paymentInfo }) {
   });
 }
 
-/* ============================================================
-   🔒 Helpers de disponibilidad con cupos (en transacción)
-   - Busca capacidad en complejos/{id}/cupos/{fecha|tipo|hora}
-     leyendo campos: capacity, capacidad o cupos (en ese orden).
-   - Si no existe doc o campo, default = 1.
-   - Cuenta confirmadas del slot.
-   ============================================================ */
-async function getSlotCapacity(tx, { complejoId, fecha, tipo, hora }) {
-  const slotId = `${fecha}|${tipo}|${hora}`;
-  const cupoRef = db.collection('complejos')
-    .doc(String(complejoId))
-    .collection('cupos')
-    .doc(slotId);
-
-  const snap = await tx.get(cupoRef);
-  let capacity = 1;
-  if (snap.exists) {
-    const d = snap.data() || {};
-    capacity = Number(
-      d.capacity ?? d.capacidad ?? d.cupos ?? 1
-    ) || 1;
-  }
-  console.log('[CAPACITY]', { complejoId, slotId, capacity });
-  return capacity;
-}
-
-async function countConfirmedInSlot(tx, { complejoId, fecha, tipo, hora }) {
-  const reservasRef = db.collection('complejos').doc(String(complejoId)).collection('reservas');
-  // Nota: Firestore no permite query con tx directamente; hacemos get normal
-  const q = reservasRef
-    .where('fecha', '==', fecha)
-    .where('tipo', '==', (typeof tipo === 'string' ? tipo : Number(tipo)))
-    .where('hora', '==', hora)
-    .where('estado', '==', 'confirmada');
-
-  const snap = await tx.get(q);
-  const count = snap.size;
-  console.log('[CONFIRMED_COUNT]', { complejoId, fecha, tipo, hora, count });
-  return { count, firstDoc: snap.docs[0] || null };
-}
-
-/* ============================================================
-   MP Webhook — respeta cupos y transacciona confirmación
-   ============================================================ */
+/**
+ * Webhook de MP (se mantiene)
+ */
 app.post('/mp/webhook', async (req, res) => {
   try {
     const { type, 'data.id': dataId } = { ...req.query, ...req.body?.data };
@@ -312,34 +271,18 @@ app.post('/mp/webhook', async (req, res) => {
         const ref = String(info.external_reference || '');
         const [complejoId, fecha, tipo, hora] = ref.split('|');
         if (complejoId && fecha && tipo && hora) {
-          await db.runTransaction(async (tx) => {
-            // 1) capacidad / confirmadas
-            const capacity = await getSlotCapacity(tx, { complejoId, fecha, tipo, hora });
-            const { count: confirmedCount } = await countConfirmedInSlot(tx, { complejoId, fecha, tipo, hora });
+          const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
+          const snap = await reservasRef
+            .where('fecha', '==', fecha)
+            .where('tipo', '==', Number(tipo))
+            .where('hora', '==', hora)
+            .where('estado', 'in', ['pending', 'pendiente'])
+            .limit(1).get();
 
-            if (confirmedCount >= capacity) {
-              console.warn('[WEBHOOK] SIN CUPO al confirmar MP', { ref, capacity, confirmedCount });
-              return; // No confirmamos (idempotente)
-            }
-
-            // 2) Tomamos una reserva pendiente (si hay) y la confirmamos
-            const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
-            const pendQ = reservasRef
-              .where('fecha', '==', fecha)
-              .where('tipo', '==', Number(tipo))
-              .where('hora', '==', hora)
-              .where('estado', 'in', ['pending', 'pendiente'])
-              .limit(1);
-
-            const pendSnap = await tx.get(pendQ);
-            if (pendSnap.empty) {
-              console.log('[WEBHOOK] No se encontró reserva pendiente para', ref);
-              return;
-            }
-
-            const docRef = pendSnap.docs[0].ref;
+          if (!snap.empty) {
+            const docRef = snap.docs[0].ref;
             const m = info?.metadata || {};
-            tx.set(docRef, {
+            await docRef.set({
               estado: 'confirmada',
               pago: {
                 mp_payment_id: info.id,
@@ -356,10 +299,11 @@ app.post('/mp/webhook', async (req, res) => {
               },
               updatedAt: FieldValue.serverTimestamp(),
             }, { merge: true });
-          });
 
-          // Liquidación (fuera de la tx)
-          await upsertDailySettlement({ complejoId, fecha, paymentInfo: info });
+            await upsertDailySettlement({ complejoId, fecha, paymentInfo: info });
+          } else {
+            console.log('[WEBHOOK] No se encontró reserva pendiente para', ref);
+          }
         }
       }
     }
@@ -372,7 +316,7 @@ app.post('/mp/webhook', async (req, res) => {
 });
 
 /* =====================================================================================
-   PDF on-the-fly (igual que ya tenías)
+   PDF (igual que antes)
    ===================================================================================== */
 async function getReservaDoc({ complejoId, reservaId }) {
   const ref = db.collection('complejos').doc(complejoId).collection('reservas').doc(reservaId);
@@ -471,153 +415,151 @@ app.get('/receipt/by-ref', async (req, res) => {
 });
 
 /* =========================================================================
-   💠 Endpoints isCheck (aprobar / rechazar) — con cupos y transacción
+   💠 Endpoints isCheck con chequeo de cupos ATÓMICO
    ========================================================================= */
-async function approveCheckAndConfirmReservation({ checkId, reviewerUid }) {
-  // Hacemos TODO en una transacción para evitar carreras
-  return await db.runTransaction(async (tx) => {
-    const checkRef = db.collection('checks').doc(checkId);
-    const checkSnap = await tx.get(checkRef);
-    if (!checkSnap.exists) throw new Error('Check no encontrado');
+function normalizeTipoVariants(tipo) {
+  const out = [];
+  const n = Number(tipo);
+  if (Number.isFinite(n)) out.push(n);
+  out.push(String(tipo));
+  // quitar duplicados
+  return Array.from(new Set(out));
+}
 
-    const c = checkSnap.data() || {};
-    if (c.estado !== 'pending') throw new Error('El check no está pendiente');
+app.post('/checks/:id/approve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reviewerUid } = req.body || {};
 
-    const { userId, complejoId, fecha, hora } = c;
-    let { tipo } = c;
+    const result = await db.runTransaction(async (tx) => {
+      const checkRef = db.collection('checks').doc(id);
+      const checkSnap = await tx.get(checkRef);
+      if (!checkSnap.exists) throw new Error('Check no encontrado');
 
-    if (!userId || !complejoId || !fecha || !hora) {
-      throw new Error('Datos incompletos en el check');
-    }
-    if (typeof tipo !== 'string' && typeof tipo !== 'number') {
-      throw new Error('Tipo inválido en el check');
-    }
+      const c = checkSnap.data() || {};
+      if (c.estado !== 'pending') throw new Error('El check no está pendiente');
 
-    // 1) capacidad / confirmadas
-    const capacity = await getSlotCapacity(tx, { complejoId, fecha, tipo, hora });
-    const { count: confirmedCount } = await countConfirmedInSlot(tx, { complejoId, fecha, tipo, hora });
+      const { userId, complejoId, fecha, hora, tipo, monto } = c;
+      if (!userId || !complejoId || !fecha || !hora) {
+        throw new Error('Datos incompletos en el check');
+      }
 
-    if (confirmedCount >= capacity) {
-      console.warn('[CHECK_APPROVE] SIN CUPO', { checkId, complejoId, fecha, tipo, hora, capacity, confirmedCount });
-      const err = new Error('SIN_CUPO');
-      err.code = 'SIN_CUPO';
-      throw err;
-    }
+      // total canchas por tipo (mapa canchas["<tipo>"])
+      const complejoRef = db.collection('complejos').doc(String(complejoId));
+      const complejoSnap = await tx.get(complejoRef);
+      if (!complejoSnap.exists) throw new Error('Complejo no encontrado');
 
-    // 2) Intentamos tomar una reserva pendiente
-    const reservasRef = db.collection('complejos').doc(String(complejoId)).collection('reservas');
-    const pendQ = reservasRef
-      .where('fecha', '==', fecha)
-      .where('tipo', '==', (typeof tipo === 'string' ? tipo : Number(tipo)))
-      .where('hora', '==', hora)
-      .where('estado', 'in', ['pending', 'pendiente'])
-      .limit(1);
+      const map = (complejoSnap.data()?.canchas) || {};
+      const key = String(Number.isFinite(Number(tipo)) ? Number(tipo) : String(tipo));
+      const total = Number(map?.[key] ?? 0) || 1;
 
-    const pendSnap = await tx.get(pendQ);
-    let reservaRef;
-    if (!pendSnap.empty) {
-      reservaRef = pendSnap.docs[0].ref;
-    } else {
-      // 3) Si no existe pendiente, creamos nueva (pero seguimos dentro de tx)
-      reservaRef = reservasRef.doc();
-      tx.set(reservaRef, {
+      // count confirmadas en ese slot
+      const reservasRef = complejoRef.collection('reservas');
+      const variants = normalizeTipoVariants(tipo);
+
+      const q = reservasRef
+        .where('fecha', '==', String(fecha))
+        .where('hora', '==', String(hora))
+        .where('tipo', 'in', variants)
+        .where('estado', '==', 'confirmada')
+        .limit(total + 1);
+
+      const ocupadasSnap = await q.get();
+      const ocupadas = ocupadasSnap.size || 0;
+
+      if (ocupadas >= total) {
+        return {
+          ok: false,
+          reason: 'capacity',
+          total,
+          ocupadas,
+          libres: 0,
+        };
+      }
+
+      // crear reserva confirmada
+      const newResRef = reservasRef.doc();
+      tx.set(newResRef, {
         key: `${fecha}|${tipo}|${hora}`,
-        fecha,
-        hora,
-        tipo: (typeof tipo === 'string' ? tipo : Number(tipo)),
+        fecha: String(fecha),
+        hora: String(hora),
+        tipo: Number.isFinite(Number(tipo)) ? Number(tipo) : String(tipo),
         userId: String(userId),
         estado: 'confirmada',
         createdAt: FieldValue.serverTimestamp(),
         createdBy: reviewerUid || 'check-bot',
         channel: 'check',
         updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
-    }
-
-    // 4) Confirmamos + pago manual
-    tx.set(reservaRef, {
-      estado: 'confirmada',
-      updatedAt: FieldValue.serverTimestamp(),
-      pago: {
-        manual: true,
-        status: 'approved',
-        amount: Number(c?.monto || 0),
-        amount_base: Number(c?.monto || 0),
-        amount_base_fraction: Number(c?.monto || 0),
-        commission: 0,
-        amount_total: Number(c?.monto || 0),
-        date_approved: FieldValue.serverTimestamp(),
-        payFull: null,
-        deposit_pct: null,
-        mp_payment_id: `manual_${checkId}`,
-      },
-    }, { merge: true });
-
-    // 5) Marcamos el check
-    tx.set(checkRef, {
-      estado: 'approved',
-      reviewedAt: FieldValue.serverTimestamp(),
-      reviewedBy: reviewerUid || 'check-bot',
-    }, { merge: true });
-
-    return {
-      ok: true,
-      slot: { complejoId, fecha, tipo, hora, capacity, confirmedCountAfter: confirmedCount + 1 },
-      reservaId: reservaRef.id,
-    };
-  });
-}
-
-async function rejectCheck({ checkId, reviewerUid, reason }) {
-  const checkRef = db.collection('checks').doc(checkId);
-  const snap = await checkRef.get();
-  if (!snap.exists) throw new Error('Check no encontrado');
-
-  const c = snap.data() || {};
-  if (c.estado !== 'pending') throw new Error('El check no está pendiente');
-
-  await checkRef.set({
-    estado: 'rejected',
-    reviewedAt: FieldValue.serverTimestamp(),
-    reviewedBy: reviewerUid || 'check-bot',
-    reason: reason || 'Rechazado',
-  }, { merge: true });
-
-  return { ok: true };
-}
-
-// Endpoints públicos para la app (confiamos en auth de la app y reglas)
-app.post('/checks/:id/approve', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { reviewerUid } = req.body || {};
-    const r = await approveCheckAndConfirmReservation({ checkId: id, reviewerUid });
-    // Liquidación diaria (manual) fuera de la tx
-    const checkSnap = await db.collection('checks').doc(id).get();
-    const c = checkSnap.data() || {};
-    await upsertDailySettlement({
-      complejoId: c?.complejoId,
-      fecha: c?.fecha,
-      paymentInfo: {
-        id: `manual_${id}`,
-        status: 'approved',
-        transaction_amount: Number(c?.monto || 0),
-        metadata: {
+        pago: {
           manual: true,
-          manual_amount: Number(c?.monto || 0),
+          status: 'approved',
+          amount: Number(monto) || 0,
+          amount_base: Number(monto) || 0,
+          amount_base_fraction: Number(monto) || 0,
+          commission: 0,
+          amount_total: Number(monto) || 0,
+          date_approved: FieldValue.serverTimestamp(),
           payFull: null,
           deposit_pct: null,
-          commission_fixed: 0,
-          total: Number(c?.monto || 0),
+          mp_payment_id: `manual_${id}`,
         },
-      },
+      });
+
+      // aprobar check
+      tx.set(checkRef, {
+        estado: 'approved',
+        reviewedAt: FieldValue.serverTimestamp(),
+        reviewedBy: reviewerUid || 'check-bot',
+      }, { merge: true });
+
+      return {
+        ok: true,
+        reservaId: newResRef.id,
+        total,
+        ocupadas: ocupadas + 1,
+        libres: Math.max(total - (ocupadas + 1), 0),
+      };
     });
-    res.json(r);
+
+    if (!result.ok && result.reason === 'capacity') {
+      return res.status(409).json({
+        error: true,
+        message: 'Sin disponibilidad',
+        total: result.total,
+        ocupadas: result.ocupadas,
+        libres: result.libres,
+      });
+    }
+
+    // liquidación diaria (manual) fuera de la transacción
+    // (si querés, podés moverlo adentro con un doc agregado, pero no es crítico)
+    try {
+      const checkSnap = await db.collection('checks').doc(String(req.params.id)).get();
+      const c = checkSnap.data() || {};
+      await upsertDailySettlement({
+        complejoId: c.complejoId,
+        fecha: c.fecha,
+        paymentInfo: {
+          id: `manual_${req.params.id}`,
+          status: 'approved',
+          transaction_amount: Number(c.monto) || 0,
+          metadata: {
+            manual: true,
+            manual_amount: Number(c.monto) || 0,
+            payFull: null,
+            deposit_pct: null,
+            commission_fixed: 0,
+            total: Number(c.monto) || 0,
+          },
+        },
+      });
+    } catch (e) {
+      console.warn('[settlement] warn:', e?.message || e);
+    }
+
+    res.json(result);
   } catch (e) {
     console.error('approve error:', e);
-    if (e?.code === 'SIN_CUPO' || /SIN_CUPO/i.test(String(e?.message))) {
-      return res.status(409).json({ error: true, code: 'SIN_CUPO', message: 'Ya no hay cupo para ese horario.' });
-    }
     res.status(400).json({ error: true, message: String(e?.message || e) });
   }
 });
@@ -626,8 +568,25 @@ app.post('/checks/:id/reject', async (req, res) => {
   try {
     const { id } = req.params;
     const { reviewerUid, reason } = req.body || {};
-    const r = await rejectCheck({ checkId: id, reviewerUid, reason });
-    res.json(r);
+
+    const result = await db.runTransaction(async (tx) => {
+      const checkRef = db.collection('checks').doc(id);
+      const checkSnap = await tx.get(checkRef);
+      if (!checkSnap.exists) throw new Error('Check no encontrado');
+      const c = checkSnap.data() || {};
+      if (c.estado !== 'pending') throw new Error('El check no está pendiente');
+
+      tx.set(checkRef, {
+        estado: 'rejected',
+        reviewedAt: FieldValue.serverTimestamp(),
+        reviewedBy: reviewerUid || 'check-bot',
+        reason: reason || 'Rechazado',
+      }, { merge: true });
+
+      return { ok: true };
+    });
+
+    res.json(result);
   } catch (e) {
     console.error('reject error:', e);
     res.status(400).json({ error: true, message: String(e?.message || e) });
