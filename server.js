@@ -246,8 +246,215 @@ async function upsertDailySettlement({ complejoId, fecha, paymentInfo }) {
   });
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+   🔧 Helpers de disponibilidad (capacidad por tipo y conteo consistente)
+   ────────────────────────────────────────────────────────────────────────── */
+function normalizeTipoForQuery(tipo) {
+  // Puede venir number (5..11) o string/slugs.
+  const n = Number(tipo);
+  if (!Number.isNaN(n) && `${n}` === String(tipo).trim()) return n; // num puro
+  return String(tipo).trim().toLowerCase(); // slug
+}
+
+async function getCapacityForTipo({ complejoId, tipo }) {
+  const snap = await db.collection('complejos').doc(complejoId).get();
+  if (!snap.exists) return 1;
+  const canchas = snap.data()?.canchas || {};
+  // Claves posibles "5","6","7","8","9","10","11" o slugs
+  const key1 = String(tipo);
+  const key2 = String(Number(tipo));
+  const cap = Number(canchas[key1] ?? canchas[key2] ?? 1);
+  return cap > 0 ? cap : 1;
+}
+
+async function countConfirmedAtSlot({ complejoId, fecha, tipo, hora }) {
+  const ref = db.collection('complejos').doc(complejoId).collection('reservas');
+  const tipoNorm = normalizeTipoForQuery(tipo);
+
+  // Consultas paralelas por si hay datos con tipo numérico y/o string
+  const queries = [];
+  if (typeof tipoNorm === 'number') {
+    queries.push(
+      ref.where('fecha', '==', fecha)
+         .where('tipo', '==', tipoNorm)
+         .where('hora', '==', hora)
+         .where('estado', '==', 'confirmada')
+         .get()
+    );
+    queries.push(
+      ref.where('fecha', '==', fecha)
+         .where('tipo', '==', String(tipoNorm))
+         .where('hora', '==', hora)
+         .where('estado', '==', 'confirmada')
+         .get()
+    );
+  } else {
+    queries.push(
+      ref.where('fecha', '==', fecha)
+         .where('tipo', '==', tipoNorm)
+         .where('hora', '==', hora)
+         .where('estado', '==', 'confirmada')
+         .get()
+    );
+    const asNum = Number(tipoNorm);
+    if (!Number.isNaN(asNum)) {
+      queries.push(
+        ref.where('fecha', '==', fecha)
+           .where('tipo', '==', asNum)
+           .where('hora', '==', hora)
+           .where('estado', '==', 'confirmada')
+           .get()
+      );
+    }
+  }
+
+  const snaps = await Promise.all(queries);
+  // Unimos ids para no contar duplicado si por casualidad coinciden
+  const ids = new Set();
+  snaps.forEach(s => s.forEach(d => ids.add(d.id)));
+  return ids.size;
+}
+
 /**
- * Webhook de MP (sigue igual)
+ * Ejecuta dentro de una transacción:
+ * - Lee capacidad del complejo para el tipo
+ * - Cuenta confirmadas actuales
+ * - Si hay cupo, aplica `mutator(tx, reservasRef)` para marcar/crear confirmada
+ */
+async function confirmWithCapacityTx({ complejoId, fecha, tipo, hora, mutator }) {
+  const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
+  const tipoNorm = normalizeTipoForQuery(tipo);
+
+  return db.runTransaction(async (tx) => {
+    // Capacidad
+    const complejoDoc = db.collection('complejos').doc(complejoId);
+    const complejoSnap = await tx.get(complejoDoc);
+    const canchas = (complejoSnap.exists ? (complejoSnap.data()?.canchas || {}) : {});
+    const key1 = String(tipoNorm);
+    const key2 = String(Number(tipoNorm));
+    const capacidad = Number(canchas[key1] ?? canchas[key2] ?? 1) || 1;
+
+    // Conteo confirmadas actuales (dentro de la transacción)
+    // Firestore no tiene count() en tx, así que traemos IDs mínimos.
+    const qs = [];
+    qs.push(
+      reservasRef.where('fecha', '==', fecha)
+        .where('tipo', '==', typeof tipoNorm === 'number' ? tipoNorm : String(tipoNorm))
+        .where('hora', '==', hora)
+        .where('estado', '==', 'confirmada')
+        .limit(capacidad + 2) // límite pequeño
+    );
+    if (typeof tipoNorm === 'number') {
+      qs.push(
+        reservasRef.where('fecha', '==', fecha)
+          .where('tipo', '==', String(tipoNorm))
+          .where('hora', '==', hora)
+          .where('estado', '==', 'confirmada')
+          .limit(capacidad + 2)
+      );
+    } else {
+      const asNum = Number(tipoNorm);
+      if (!Number.isNaN(asNum)) {
+        qs.push(
+          reservasRef.where('fecha', '==', fecha)
+            .where('tipo', '==', asNum)
+            .where('hora', '==', hora)
+            .where('estado', '==', 'confirmada')
+            .limit(capacidad + 2)
+        );
+      }
+    }
+
+    const snaps = await Promise.all(qs.map(q => tx.get(q)));
+    const ids = new Set();
+    snaps.forEach(s => s.forEach(d => ids.add(d.id)));
+    const confirmadas = ids.size;
+
+    if (confirmadas >= capacidad) {
+      throw new Error('Sin cupos para ese horario');
+    }
+
+    // Delegamos la mutación concreta al caller (marcar pendiente -> confirmada o crear)
+    return mutator({ tx, reservasRef, tipoNorm });
+  });
+}
+
+/**
+ * Marca una reserva "pending" del slot como confirmada (o crea una nueva)
+ * — usado tanto por Webhook como por aprobación manual
+ */
+async function upsertConfirmedAtSlot({ complejoId, fecha, tipo, hora, payloadToMerge = {} }) {
+  return confirmWithCapacityTx({
+    complejoId, fecha, tipo, hora,
+    mutator: async ({ tx, reservasRef, tipoNorm }) => {
+      // Buscamos una pendiente primero (puede venir como num o string)
+      const pendingQueries = [];
+      const eqVal1 = (typeof tipoNorm === 'number') ? tipoNorm : String(tipoNorm);
+      pendingQueries.push(
+        reservasRef.where('fecha', '==', fecha)
+          .where('tipo', '==', eqVal1)
+          .where('hora', '==', hora)
+          .where('estado', 'in', ['pending', 'pendiente'])
+          .limit(1)
+      );
+      // Alterna
+      if (typeof tipoNorm === 'number') {
+        pendingQueries.push(
+          reservasRef.where('fecha', '==', fecha)
+            .where('tipo', '==', String(tipoNorm))
+            .where('hora', '==', hora)
+            .where('estado', 'in', ['pending', 'pendiente'])
+            .limit(1)
+        );
+      } else {
+        const asNum = Number(tipoNorm);
+        if (!Number.isNaN(asNum)) {
+          pendingQueries.push(
+            reservasRef.where('fecha', '==', fecha)
+              .where('tipo', '==', asNum)
+              .where('hora', '==', hora)
+              .where('estado', 'in', ['pending', 'pendiente'])
+              .limit(1)
+          );
+        }
+      }
+
+      // Ejecutamos en serie para poder usar tx.get
+      let targetRef = null;
+      for (const q of pendingQueries) {
+        const s = await tx.get(q);
+        if (!s.empty) { targetRef = s.docs[0].ref; break; }
+      }
+
+      if (!targetRef) {
+        // Creamos una nueva (id auto) si no existía pendiente
+        targetRef = reservasRef.doc();
+        tx.set(targetRef, {
+          key: `${fecha}|${typeof tipoNorm === 'number' ? tipoNorm : String(tipoNorm)}|${hora}`,
+          fecha,
+          hora,
+          tipo: (typeof tipoNorm === 'number' ? tipoNorm : String(tipoNorm)),
+          estado: 'confirmada',
+          createdAt: FieldValue.serverTimestamp(),
+          channel: 'check',
+          ...payloadToMerge, // datos adicionales
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      } else {
+        tx.set(targetRef, {
+          estado: 'confirmada',
+          ...payloadToMerge,
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+
+      return { ok: true, id: targetRef.id };
+    }
+  });
+}
+
+/**
+ * Webhook de MP (sigue igual en forma, pero ahora respeta capacidad)
  */
 app.post('/mp/webhook', async (req, res) => {
   try {
@@ -271,39 +478,30 @@ app.post('/mp/webhook', async (req, res) => {
         const ref = String(info.external_reference || '');
         const [complejoId, fecha, tipo, hora] = ref.split('|');
         if (complejoId && fecha && tipo && hora) {
-          const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
-          const snap = await reservasRef
-            .where('fecha', '==', fecha)
-            .where('tipo', '==', Number(tipo))
-            .where('hora', '==', hora)
-            .where('estado', 'in', ['pending', 'pendiente'])
-            .limit(1).get();
-
-          if (!snap.empty) {
-            const docRef = snap.docs[0].ref;
-            const m = info?.metadata || {};
-            await docRef.set({
-              estado: 'confirmada',
+          // Confirmar respetando capacidad (transacción)
+          await upsertConfirmedAtSlot({
+            complejoId,
+            fecha,
+            tipo,
+            hora,
+            payloadToMerge: {
               pago: {
                 mp_payment_id: info.id,
                 status: info.status,
                 date_approved: info.date_approved || FieldValue.serverTimestamp(),
                 amount: info.transaction_amount,
-                amount_base: m.basePrice ?? null,
-                amount_base_fraction: m.base_fraction_amount ?? null,
-                commission: m.commission_fixed ?? COMMISSION_FIXED,
-                amount_total: m.total ?? info.transaction_amount,
-                payFull: m.payFull ?? null,
-                deposit_pct: m.deposit_pct ?? null,
+                amount_base: info?.metadata?.basePrice ?? null,
+                amount_base_fraction: info?.metadata?.base_fraction_amount ?? null,
+                commission: info?.metadata?.commission_fixed ?? COMMISSION_FIXED,
+                amount_total: info?.metadata?.total ?? info.transaction_amount,
+                payFull: info?.metadata?.payFull ?? null,
+                deposit_pct: info?.metadata?.deposit_pct ?? null,
                 manual: false,
               },
-              updatedAt: FieldValue.serverTimestamp(),
-            }, { merge: true });
+            },
+          });
 
-            await upsertDailySettlement({ complejoId, fecha, paymentInfo: info });
-          } else {
-            console.log('[WEBHOOK] No se encontró reserva pendiente para', ref);
-          }
+          await upsertDailySettlement({ complejoId, fecha, paymentInfo: info });
         }
       }
     }
@@ -331,16 +529,35 @@ async function findReservaByExternalRef(external_reference) {
   if (!complejoId || !fecha || !tipo || !hora) return null;
 
   const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
-  const q = reservasRef
-    .where('fecha', '==', fecha)
-    .where('tipo', '==', Number(tipo))
-    .where('hora', '==', hora)
-    .where('estado', '==', 'confirmada')
-    .limit(1);
-  const snap = await q.get();
-  if (snap.empty) return null;
-  const d = snap.docs[0];
-  return { id: d.id, ref: d.ref, data: d.data(), complejoId };
+
+  // Buscamos por num y string para robustez
+  const tipoNorm = normalizeTipoForQuery(tipo);
+  const qs = [];
+  qs.push(
+    reservasRef.where('fecha', '==', fecha)
+      .where('tipo', '==', typeof tipoNorm === 'number' ? tipoNorm : String(tipoNorm))
+      .where('hora', '==', hora)
+      .where('estado', '==', 'confirmada')
+      .limit(1)
+  );
+  if (typeof tipoNorm === 'number') {
+    qs.push(
+      reservasRef.where('fecha', '==', fecha)
+        .where('tipo', '==', String(tipoNorm))
+        .where('hora', '==', hora)
+        .where('estado', '==', 'confirmada')
+        .limit(1)
+    );
+  }
+
+  for (const q of qs) {
+    const snap = await q.get();
+    if (!snap.empty) {
+      const d = snap.docs[0];
+      return { id: d.id, ref: d.ref, data: d.data(), complejoId };
+    }
+  }
+  return null;
 }
 
 function streamReservaPDF({ res, reserva, complejoId }) {
@@ -432,53 +649,36 @@ async function approveCheckAndConfirmReservation({ checkId, reviewerUid }) {
     throw new Error('Datos incompletos en el check');
   }
 
-  // Creamos/actualizamos una reserva "pending" -> "confirmada"
-  const reservasRef = db.collection('complejos').doc(complejoId).collection('reservas');
-  const q = await reservasRef
-    .where('fecha', '==', fecha)
-    .where('tipo', '==', (typeof tipo === 'string' ? tipo : Number(tipo)))
-    .where('hora', '==', hora)
-    .where('estado', 'in', ['pending', 'pendiente'])
-    .limit(1)
-    .get();
-
-  let reservaRef;
-  if (!q.empty) {
-    reservaRef = q.docs[0].ref;
-  } else {
-    // Si no existe pendiente, creamos una nueva confirmada por canal "check"
-    reservaRef = reservasRef.doc();
-    await reservaRef.set({
-      key: `${fecha}|${tipo}|${hora}`,
-      fecha,
-      hora,
-      tipo: (typeof tipo === 'string' ? tipo : Number(tipo)),
+  // Confirmar respetando capacidad (transacción)
+  await upsertConfirmedAtSlot({
+    complejoId,
+    fecha,
+    tipo,
+    hora,
+    payloadToMerge: {
       userId,
-      estado: 'confirmada',
-      createdAt: FieldValue.serverTimestamp(),
+      fullName: c?.createdByName || c?.userName || c?.displayName || null,
+      email: c?.createdByEmail || c?.userEmail || null,
+      phone: c?.createdByPhone || c?.userPhone || null,
+      complejoNombre: c?.complejoName || null,
+      address: c?.address || null,
+      pago: {
+        manual: true,
+        status: 'approved',
+        amount: Number(monto) || 0,
+        amount_base: Number(monto) || 0,
+        amount_base_fraction: Number(monto) || 0,
+        commission: 0,
+        amount_total: Number(monto) || 0,
+        date_approved: FieldValue.serverTimestamp(),
+        mp_payment_id: `manual_${checkId}`,
+        payFull: null,
+        deposit_pct: null,
+      },
       createdBy: reviewerUid || 'check-bot',
       channel: 'check',
-    }, { merge: true });
-  }
-
-  // Marcar confirmada + pago "manual"
-  await reservaRef.set({
-    estado: 'confirmada',
-    updatedAt: FieldValue.serverTimestamp(),
-    pago: {
-      manual: true,
-      status: 'approved',
-      amount: Number(monto) || 0,
-      amount_base: Number(monto) || 0,
-      amount_base_fraction: Number(monto) || 0,
-      commission: 0,
-      amount_total: Number(monto) || 0,
-      date_approved: FieldValue.serverTimestamp(),
-      payFull: null,
-      deposit_pct: null,
-      mp_payment_id: `manual_${checkId}`,
     },
-  }, { merge: true });
+  });
 
   // Actualizamos el check a approved
   await checkRef.set({
@@ -556,4 +756,3 @@ app.post('/checks/:id/reject', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`MP backend listening on :${PORT}`);
 });
- 
